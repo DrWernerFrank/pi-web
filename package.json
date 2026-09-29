@@ -1,0 +1,21 @@
+{
+  "name": "pi-web",
+  "version": "1.0.0",
+  "private": true,
+  "description": "A browser GUI for the pi coding agent: read sessions live, chat, answer quizzes.",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node server.mjs"
+  },
+  "dependencies": {
+    "@highlightjs/cdn-assets": "^11.11.1",
+    "dompurify": "^3.2.6",
+    "katex": "^0.16.22",
+    "markdown-it": "^14.1.0",
+    "mermaid": "^11.9.0",
+    "vazirmatn": "^33.0.3"
+  }
+}

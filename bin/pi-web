@@ -1,0 +1,149 @@
+#!/usr/bin/env bash
+# pi-web: start / stop the browser GUI for pi.
+#
+#   pi-web            start in the background (inside tmux) and open the browser
+#   pi-web window     same, then show the server window (log + pi subagent panes)
+#   pi-web stop       stop pi-web and the pi processes it started
+#   pi-web restart    stop, then start
+#   pi-web status     say whether it is running
+#   pi-web logs       show the server window (Ctrl+b then d to leave it running)
+#   pi-web run        run in this terminal instead of tmux (Ctrl+C stops it)
+#
+# Options: --port N (default 3141, or $PI_WEB_PORT)   --no-open
+
+set -uo pipefail
+
+HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+PORT="${PI_WEB_PORT:-3141}"
+OPEN=1
+CMD="start"
+TMUX_SESSION="pi-web"
+
+usage() { sed -n '2,13p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+
+while [ $# -gt 0 ]; do
+	case "$1" in
+		--port) PORT="${2:?--port needs a number}"; shift 2 ;;
+		--port=*) PORT="${1#*=}"; shift ;;
+		--no-open) OPEN=0; shift ;;
+		-h|--help|help) CMD="help"; shift ;;
+		start|open|window|stop|restart|status|logs|attach|run) CMD="$1"; shift ;;
+		*) echo "pi-web: unknown argument: $1" >&2; usage >&2; exit 2 ;;
+	esac
+done
+URL="http://localhost:$PORT"
+
+# Prefer the node that runs pi (pi needs a recent one).
+node_bin() {
+	local pi
+	pi="$(command -v pi 2>/dev/null || true)"
+	if [ -n "$pi" ] && [ -x "$(dirname "$pi")/node" ]; then
+		echo "$(dirname "$pi")/node"
+		return
+	fi
+	command -v node 2>/dev/null || true
+}
+
+NODE="$(node_bin)"
+if [ -z "$NODE" ]; then
+	echo "pi-web: node was not found. Run pi-web from a shell where the pi command works." >&2
+	exit 1
+fi
+
+is_up() {
+	"$NODE" -e "fetch('$URL/api/health',{signal:AbortSignal.timeout(1500)}).then(r=>r.json()).then(j=>process.exit(j.ok?0:1),()=>process.exit(1))" 2>/dev/null
+}
+
+open_browser() {
+	[ "$OPEN" = 1 ] || return 0
+	if grep -qi microsoft /proc/version 2>/dev/null; then
+		# Inside WSL: use the Windows default browser.
+		if command -v cmd.exe >/dev/null 2>&1; then
+			(cd /mnt/c 2>/dev/null && cmd.exe /c start "" "$URL" >/dev/null 2>&1) && return 0
+		fi
+		if command -v explorer.exe >/dev/null 2>&1; then
+			explorer.exe "$URL" >/dev/null 2>&1
+			return 0
+		fi
+	fi
+	if command -v xdg-open >/dev/null 2>&1; then
+		xdg-open "$URL" >/dev/null 2>&1 &
+		return 0
+	fi
+	if command -v open >/dev/null 2>&1; then
+		open "$URL"
+		return 0
+	fi
+	echo "Open $URL in your browser."
+}
+
+has_tmux() { [ -z "${PI_WEB_NO_TMUX:-}" ] && command -v tmux >/dev/null 2>&1; }
+
+start_server() {
+	if is_up; then
+		echo "pi-web is already running at $URL"
+		return 0
+	fi
+	if [ ! -d "$HERE/node_modules/markdown-it" ]; then
+		echo "pi-web: its libraries are missing. Run: (cd '$HERE' && npm install)" >&2
+		return 1
+	fi
+	if has_tmux; then
+		tmux kill-session -t "$TMUX_SESSION" 2>/dev/null
+		# Running inside tmux lets pi's subagents open their panes from the GUI too.
+		tmux new-session -d -s "$TMUX_SESSION" -c "$HERE" \
+			"'$NODE' '$HERE/server.mjs' --port '$PORT'; echo; echo 'pi-web has stopped. Press Enter to close.'; read -r _"
+	else
+		mkdir -p "$HOME/.cache/pi-web"
+		nohup "$NODE" "$HERE/server.mjs" --port "$PORT" >"$HOME/.cache/pi-web/server.log" 2>&1 &
+	fi
+	for _ in $(seq 1 80); do
+		is_up && break
+		sleep 0.25
+	done
+	if is_up; then
+		echo "pi-web is running at $URL"
+	else
+		echo "pi-web did not start. Look at: pi-web logs" >&2
+		return 1
+	fi
+}
+
+stop_server() {
+	# SIGTERM lets the server close its pi processes cleanly.
+	pkill -TERM -f "$HERE/server.mjs --port $PORT" 2>/dev/null
+	for _ in $(seq 1 40); do
+		is_up || break
+		sleep 0.25
+	done
+	has_tmux && tmux kill-session -t "$TMUX_SESSION" 2>/dev/null
+	echo "pi-web stopped."
+}
+
+show_window() {
+	if ! has_tmux; then
+		echo "tmux is not installed; the log is in ~/.cache/pi-web/server.log"
+		return 0
+	fi
+	if [ -n "${TMUX:-}" ]; then
+		tmux switch-client -t "$TMUX_SESSION"
+	else
+		exec tmux attach -t "$TMUX_SESSION"
+	fi
+}
+
+case "$CMD" in
+	start|open) start_server && open_browser ;;
+	window) start_server && open_browser && show_window ;;
+	stop) stop_server ;;
+	restart) stop_server; start_server && open_browser ;;
+	status)
+		if is_up; then echo "pi-web is running at $URL"; else echo "pi-web is not running"; exit 1; fi
+		;;
+	logs|attach) show_window ;;
+	run)
+		open_browser
+		exec "$NODE" "$HERE/server.mjs" --port "$PORT"
+		;;
+	help) usage ;;
+esac
