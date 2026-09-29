@@ -129,6 +129,24 @@ Environment variables (set before `pi-web`, e.g. in `~/.bashrc`):
 
 The page itself (**⋯** menu): show/hide tool calls and thinking, light/dark/auto theme, text size.
 
+## Version control
+
+The pi-web folder is a **git repository** (tag `v1.1.0` is tonight's tested state; the project had no version control before that). pi-web shows the running **version + commit** in the ⋯ menu footer and in `/api/health`, so "which build am I on?" is always answerable — useful when agents edit this project.
+
+Ignored: `node_modules/`, `pi-web-uploads/` (your uploads), `.env` (secrets — never commit it).
+
+Common tasks:
+
+```bash
+cd /mnt/c/Users/Hp/Desktop/projects/pi-web
+git log --oneline              # what changed
+git add -A && git commit -m "…"  # snapshot before/after an agent's work
+git checkout v1.1.0 -- .        # roll the code back to the tagged state
+git stash                      # …or drop uncommitted edits
+```
+
+After any checkout/stash, **restart** so the running server picks up the files: `pi-web restart`, then reload the page (each server run has its own token).
+
 ## Safety
 
 pi-web can run pi, and pi can run commands, so the server only listens on `127.0.0.1`. It rejects requests with a foreign `Host` header (blocks DNS rebinding) and requires a per-run token on every action (blocks other websites). Images from the internet inside messages are not loaded automatically: a model could leak data through an image URL. They show as links instead.
