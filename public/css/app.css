@@ -440,6 +440,31 @@ a {
 	background: var(--bg-soft);
 	color: var(--muted);
 }
+.pin-head {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	padding: 10px 10px 4px;
+	font-size: 11px;
+	font-weight: 700;
+	letter-spacing: 0.05em;
+	text-transform: uppercase;
+	color: var(--faint);
+	user-select: none;
+}
+.pin-head .icon {
+	width: 12px;
+	height: 12px;
+}
+.pin-mark {
+	flex: none;
+	color: var(--accent-text);
+	display: inline-flex;
+}
+.pin-mark .icon {
+	width: 12px;
+	height: 12px;
+}
 .session-row {
 	display: block;
 	padding: 7px 10px;

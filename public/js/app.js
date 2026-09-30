@@ -660,6 +660,20 @@ function matchesSearch(s, q) {
 	return [s.name, s.firstUser, s.cwd, s.agent, s.agentName, s.id].some((v) => v && String(v).toLowerCase().includes(q));
 }
 
+// ── pinned chats ────────────────────────────────────────────────────────────
+// A short list of ids kept in localStorage; pinned chats sit above the folder
+// groups, always visible (and never folded away by a group's "Show more").
+function pinnedIds() {
+	return new Set(storage("pi-web:pinned", []));
+}
+function togglePinned(s) {
+	const ids = pinnedIds();
+	if (ids.has(s.id)) ids.delete(s.id);
+	else ids.add(s.id);
+	store("pi-web:pinned", [...ids]);
+	renderSessionList();
+}
+
 function renderSessionList() {
 	const list = $("#session-list");
 	const q = S.search.trim().toLowerCase();
@@ -691,13 +705,35 @@ function renderSessionList() {
 		})
 		.sort((a, b) => activity(b.items[0]) - activity(a.items[0]));
 
+	// Pinned chats break out of their folder groups: a flat block above them,
+	// always expanded, never behind a group's "Show more". That's the point —
+	// a chat you pin is one you don't want to hunt for inside a folder stack.
+	const pins = pinnedIds();
+	const pinnedRows = q ? [] : visible.filter((s) => pins.has(s.id) && !s.parentId).sort((a, b) => activity(b) - activity(a));
+
 	const frag = document.createDocumentFragment();
-	if (!ordered.length) {
+	if (pinnedRows.length) {
+		frag.append(h("div", { class: "pin-head" }, h("span", { class: "chev", html: icon("pin") }), "Pinned"));
+		for (const s of pinnedRows) frag.append(sessionRow(s, childrenOf.get(s.id) || []));
+	}
+	if (!ordered.length && !pinnedRows.length) {
 		frag.append(h("div", { class: "list-empty" }, q ? "No chats match — neither by name nor inside their messages." : "No pi sessions found yet."));
 	}
 	for (const group of ordered) {
 		const collapsedKey = `pi-web:group:${group.cwd}`;
-		const collapsed = !q && storage(collapsedKey, false) && !group.items.some((s) => s.id === S.current);
+		// Folders clean themselves up: a folder you haven't been in for two weeks
+		// collapses on its own, so old projects stop pushing your active ones down.
+		// Touching the folder (expanding it) resets its timer.
+		const autoCollapseDays = 14;
+		let collapsed = storage(collapsedKey, false);
+		if (!q && !collapsed && !group.items.some((s) => s.id === S.current)) {
+			const newest = activity(group.items[0]);
+			if (Number.isFinite(newest) && Date.now() - newest > autoCollapseDays * 86400_000) {
+				collapsed = true;
+				store(collapsedKey, true); // so it stays quiet across renders
+			}
+		}
+		if (!collapsed && group.items.some((s) => s.id === S.current)) store(collapsedKey, false);
 		const head = h(
 			"button",
 			{ class: `group-head${group.agy ? " agy" : ""}`, type: "button", title: group.agy ? "Google Antigravity conversations" : group.cwd, "aria-expanded": String(!collapsed) },
@@ -710,6 +746,10 @@ function renderSessionList() {
 			store(collapsedKey, !collapsed);
 			renderSessionList();
 		};
+		head.addEventListener("contextmenu", (e) => {
+			e.preventDefault();
+			openGroupMenu(group, e.clientX, e.clientY, collapsedKey, collapsed);
+		});
 		frag.append(head);
 		if (collapsed) continue;
 		const limitKey = `pi-web:limit:${group.cwd}`;
@@ -750,6 +790,7 @@ function renderSessionList() {
 
 function sessionRow(s, children) {
 	const proc = S.procs.get(s.id);
+	const pins = pinnedIds();
 	const running = proc && proc.state !== "exited" && proc.state !== "stopping";
 	let badge = null;
 	if (S.attention.has(s.id)) badge = h("span", { class: "badge attention", title: "pi is waiting for your answer" });
@@ -782,6 +823,7 @@ function sessionRow(s, children) {
 			)
 		: null;
 	const archBadge = s.archived && !q ? h("span", { class: "row-kids" }, " · archived") : q && s.archived ? h("span", { class: "arch-chip" }, "archived") : null;
+	const pinMark = q && pins.has(s.id) ? h("span", { class: "pin-mark", title: "Pinned", html: icon("pin") }) : null;
 	const row = h(
 		"a",
 		{ class: `session-row${s.id === S.current ? " active" : ""}${s.parentId ? " child" : ""}${hit ? " hit" : ""}`, href: `#/s/${encodeURIComponent(s.id)}`, title },
@@ -792,6 +834,7 @@ function sessionRow(s, children) {
 			h("span", { class: "row-title", dir: textDir(title) || "auto" }, s.parentId && s.agentName ? `${s.agent || "agent"} · ${s.agentName}` : title),
 			badge,
 			archBadge,
+			pinMark,
 		),
 		h("div", { class: "row-sub" }, sub, kids),
 		snippet,
@@ -1019,6 +1062,45 @@ async function confirmDeleteSession(s) {
 	}
 }
 
+/** Right-click on a folder header: quick ways to tidy it. */
+function openGroupMenu(group, x, y, collapsedKey, collapsed) {
+	const entry = (label, iconName, fn) =>
+		h(
+			"button",
+			{
+				class: "menu-item",
+				type: "button",
+				onclick: () => {
+					closePopover();
+					fn();
+				},
+			},
+			h("span", { html: icon(iconName) }),
+			label,
+		);
+	openPopoverAt(
+		x,
+		y,
+		h(
+			"div",
+			{ class: "menu" },
+			entry(collapsed ? "Expand" : "Collapse", collapsed ? "chevronDown" : "chevronRight", () => {
+				store(collapsedKey, !collapsed);
+				renderSessionList();
+			}),
+			entry("Show all its chats", "layers", () => {
+				store(`pi-web:limit:${group.cwd}`, 500);
+				store(collapsedKey, false);
+				renderSessionList();
+			}),
+			entry("Reset to 25", "refresh", () => {
+				store(`pi-web:limit:${group.cwd}`, 25);
+				renderSessionList();
+			}),
+		),
+	);
+}
+
 function openSessionMenu(s, x, y) {
 	const entry = (label, iconName, fn, danger) =>
 		h(
@@ -1035,6 +1117,7 @@ function openSessionMenu(s, x, y) {
 			label,
 		);
 	const items = [entry("Open", "external", () => navigate(s.id))];
+	items.push(entry(pinnedIds().has(s.id) ? "Unpin" : "Pin", "pin", () => togglePinned(s)));
 	if (!isAgy(s) && s.file) items.push(entry("Copy file path", "copy", () => copy(s.file)));
 	items.push(entry(s.archived ? "Unarchive" : "Archive", "archive", () => archiveSession(s, !s.archived)));
 	if (isAgy(s)) {
