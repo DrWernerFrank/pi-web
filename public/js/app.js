@@ -717,7 +717,7 @@ function renderSessionList() {
 		for (const s of pinnedRows) frag.append(sessionRow(s, childrenOf.get(s.id) || []));
 	}
 	if (!ordered.length && !pinnedRows.length) {
-		frag.append(h("div", { class: "list-empty" }, q ? "No chats match — neither by name nor inside their messages." : "No pi sessions found yet."));
+		frag.append(h("div", { class: "list-empty" }, q ? "No chats match — neither by name nor inside their messages." : "No chats yet. Hit “New chat” and say something."));
 	}
 	for (const group of ordered) {
 		const collapsedKey = `pi-web:group:${group.cwd}`;
@@ -799,8 +799,8 @@ function sessionRow(s, children) {
 	else if (isAgy(s) && s.running) badge = h("span", { class: "badge busy", title: "Antigravity is working on this" });
 	else if (isExternallyActive(s)) badge = h("span", { class: "badge external", title: "Recently active (probably in your terminal)" });
 
+	const when = fmtRelative(activity(s));
 	const sub = [
-		fmtRelative(activity(s)),
 		isAgy(s) ? (s.stepCount ? `${s.stepCount} steps` : null) : s.userCount ? `${s.userCount} msg` : null,
 		isAgy(s) ? null : shortModel(s.lastModel),
 	]
@@ -826,7 +826,11 @@ function sessionRow(s, children) {
 	const pinMark = q && pins.has(s.id) ? h("span", { class: "pin-mark", title: "Pinned", html: icon("pin") }) : null;
 	const row = h(
 		"a",
-		{ class: `session-row${s.id === S.current ? " active" : ""}${s.parentId ? " child" : ""}${hit ? " hit" : ""}`, href: `#/s/${encodeURIComponent(s.id)}`, title },
+		{
+			class: `session-row${s.id === S.current ? " active" : ""}${s.parentId ? " child" : ""}${hit ? " hit" : ""}${runningSubs ? " kids-live" : ""}${!q && pins.has(s.id) ? " pinned" : ""}`,
+			href: `#/s/${encodeURIComponent(s.id)}`,
+			title: [title, [when, sub].filter(Boolean).join(" · ")].join("\n"),
+		},
 		h(
 			"div",
 			{ class: "row-main" },
@@ -835,6 +839,7 @@ function sessionRow(s, children) {
 			badge,
 			archBadge,
 			pinMark,
+			h("span", { class: "row-time" }, when),
 		),
 		h("div", { class: "row-sub" }, sub, kids),
 		snippet,
