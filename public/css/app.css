@@ -1361,7 +1361,8 @@ select:focus-visible {
 	font-weight: 700;
 	color: var(--accent);
 }
-.empty-logo {
+.empty-logo,
+.home-logo {
 	display: grid;
 	place-items: center;
 	width: 72px;
@@ -1388,7 +1389,7 @@ select:focus-visible {
 	margin: 10px 0;
 }
 .live-row.copy-row {
-	justify-content: flex-end;
+	justify-content: flex-start;
 }
 .live-row.warn {
 	color: var(--warn);
@@ -2363,6 +2364,16 @@ button.qa-option:hover {
 	width: 100%;
 	margin: 0 auto;
 	position: relative;
+}
+/* text scrolling under the composer fades out instead of being cut */
+.composer-wrap::before {
+	content: "";
+	position: absolute;
+	inset-inline: 0;
+	top: -28px;
+	height: 28px;
+	background: linear-gradient(to bottom, transparent, var(--bg));
+	pointer-events: none;
 }
 .dock:empty {
 	display: none;

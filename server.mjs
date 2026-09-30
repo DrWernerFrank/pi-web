@@ -17,7 +17,7 @@ import { ModelCatalog } from "./lib/models.mjs";
 import { PiProcess } from "./lib/pi-process.mjs";
 import { SessionIndex, SessionTail, readFullEntry, readImage } from "./lib/sessions.mjs";
 import { ClaudeUsage } from "./lib/usage.mjs";
-import { dropPersisted } from "./public/js/live.js";
+import { createLive, dropPersisted } from "./public/js/live.js";
 
 const VERSION = "1.1.0";
 const IDLE_STOP_MS = 20 * 60 * 1000;
@@ -540,6 +540,13 @@ async function startFailed(p, err) {
 
 async function ensureProc(sessionId) {
 	let p = procs.get(sessionId);
+	if (p?.adopted) {
+		// A pi that outlived a crash: fine for answering its open quizzes, but
+		// its stdin is gone. Stop it and start a clean one on the same session.
+		p.stop();
+		procs.delete(sessionId);
+		p = undefined;
+	}
 	if (p && p.state !== "exited" && p.state !== "stopping") {
 		await p.ready;
 		return p;
@@ -591,7 +598,57 @@ function learnModels(p) {
 
 function procByKey(key) {
 	for (const p of allProcs) if (p.key === key) return p;
+	// Adopted orphans (below) live in procs, not allProcs.
+	for (const p of procs.values()) if (p.key === key) return p;
 	return undefined;
+}
+
+/** A pi that survived a pi-web crash: its stdin died with the old server, but
+ *  its bridge socket can re-attach (the Bridge re-attaches by key on hello).
+ *  Adopt it so its open quizzes stay answerable; the next real message swaps
+ *  it for a clean pi on the same session file (see ensureProc). */
+function adoptOrphan(key, pid) {
+	let args;
+	try {
+		args = fs.readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0");
+	} catch {
+		return undefined;
+	}
+	const i = args.indexOf("--session");
+	if (i < 0 || !args[i + 1]) return undefined;
+	const meta = index.getByFile(args[i + 1]);
+	if (!meta || procs.has(meta.id)) return undefined; // a live server-spawned pi owns it
+	const stub = {
+		key,
+		sessionId: meta.id,
+		sessionFile: meta.file,
+		sessionName: meta.name,
+		cwd: meta.cwd,
+		adopted: true,
+		pid,
+		state: "ready",
+		startedAt: Date.now(),
+		live: createLive(),
+		info() {
+			return { state: "ready", pid, adopted: true, sessionId: this.sessionId, sessionFile: this.sessionFile, sessionName: this.sessionName, busy: this.live.busy };
+		},
+		write() {
+			return false; // stdin went with the old server
+		},
+		request() {
+			return Promise.reject(new Error("this pi survived a pi-web restart; it is being replaced"));
+		},
+		stop() {
+			try {
+				process.kill(pid, "SIGTERM");
+			} catch {
+				// already gone
+			}
+		},
+	};
+	procs.set(meta.id, stub);
+	console.log(`[pi-web] adopted orphan pi (pid ${pid}) for session ${meta.id}`);
+	return stub;
 }
 
 /** Unblock anything pi is waiting on from the user (used before aborting). */
@@ -604,8 +661,9 @@ function cancelInteractive(p) {
 	}
 }
 
-bridge.on("connect", (key) => {
-	const p = procByKey(key);
+bridge.on("connect", (key, pid) => {
+	let p = procByKey(key);
+	if (!p && typeof pid === "number") p = adoptOrphan(key, pid);
 	if (!p) return;
 	p.bridgeConnected = true;
 	broadcastSession(p.sessionId, "proc", p.info());
