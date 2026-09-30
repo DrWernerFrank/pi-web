@@ -260,10 +260,21 @@ async function geminiLoginModal() {
 	p.then(() => (stop = true));
 	const paint = (st) => {
 		const l = st.login || {};
-		if (st.auth === "subscription") {
+		if (st.auth === "subscription" && st.usable !== false) {
 			statusLine.textContent = `✓ Ready — your Google account (${prettyPath(st.loginPath || "")}).`;
 			startBtn.hidden = true;
 			link.hidden = true;
+		} else if (st.auth === "subscription" && st.usable === false) {
+			// A Gemini CLI login exists, but it cannot read images (no consumer
+			// scope and no Code Assist project on the account). Say so instead of
+			// a false "Ready" — the login button below is what fixes it.
+			statusLine.textContent = `A Gemini CLI login exists (${prettyPath(st.loginPath || "")}), but it can't read images. Log in below to grant image reading — it takes one click and replaces nothing.`;
+			startBtn.hidden = false;
+			startBtn.textContent = "Log in with Google";
+		} else if (st.auth === "login-only") {
+			statusLine.textContent = "A Gemini CLI login exists, but it can't read images (no consumer scope, no Code Assist project). Log in below — one click — to grant image reading.";
+			startBtn.hidden = false;
+			startBtn.textContent = "Log in with Google";
 		} else if (st.auth === "api-key") {
 			statusLine.textContent = "✓ Ready — using GEMINI_API_KEY. Subscription login would replace it.";
 		} else if (l.pending) {
@@ -286,7 +297,8 @@ async function geminiLoginModal() {
 		} catch {
 			/* server hiccup: keep the last state */
 		}
-		if (!stop && !document.querySelector(".gemini-status")?.textContent?.startsWith("✓")) setTimeout(poll, 1500);
+		const txt = document.querySelector(".gemini-status")?.textContent || "";
+		if (!stop && !txt.startsWith("✓")) setTimeout(poll, 1500);
 	};
 	poll();
 	startBtn.onclick = async () => {
