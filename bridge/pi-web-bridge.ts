@@ -22,6 +22,9 @@ type Pending = {
 	resolve: (value: unknown) => void;
 	key?: (data: string) => void;
 	resize?: () => void;
+	/** Re-send the dialog to the page (used after the socket reconnects, so a
+	 *  page that reconnected still sees the quiz it was answering). */
+	announce?: () => void;
 };
 
 type RunningTool = {
@@ -42,6 +45,13 @@ type BridgeState = {
 	patched: WeakSet<object>;
 	cols: number;
 	seq: number;
+	// Reconnection state: the server re-attaches by key on every hello, so a
+	// dropped socket is always recoverable — the bridge just has to retry.
+	reconnectTimer?: ReturnType<typeof setTimeout>;
+	connectFailures: number;
+	// ui_close messages that arrived while disconnected, flushed on reconnect
+	// so the page's cards don't linger after the pipe comes back.
+	outbox: Array<Record<string, unknown>>;
 };
 
 const STATE_KEY = "__piWebBridge";
@@ -59,6 +69,8 @@ function bridgeState(): BridgeState {
 			patched: new WeakSet(),
 			cols: 100,
 			seq: 0,
+			connectFailures: 0,
+			outbox: [],
 		};
 		// Keep the socket address out of every command pi runs from here on.
 		delete process.env.PI_WEB_BRIDGE_SOCK;
@@ -75,7 +87,20 @@ function connect(state: BridgeState): void {
 	sock.setEncoding("utf8");
 	sock.on("connect", () => {
 		state.sock = sock;
+		state.connectFailures = 0;
 		send(state, { t: "hello", key: state.key, pid: process.pid });
+		// Back after a drop: re-announce every dialog that was open when the
+		// socket died, so a page that reconnected still shows the quiz it was
+		// halfway through answering — and can still answer it.
+		for (const p of state.pending.values()) {
+			try {
+				p.announce?.();
+			} catch {
+				// announcing must never break the connection
+			}
+		}
+		// Cards closed while we were down: tell the page now.
+		for (const msg of state.outbox.splice(0)) send(state, msg);
 	});
 	sock.on("data", (chunk: string) => {
 		buffer += chunk;
@@ -93,14 +118,38 @@ function connect(state: BridgeState): void {
 	});
 	sock.on("error", () => {});
 	sock.on("close", () => {
-		state.sock = null;
-		for (const p of [...state.pending.values()]) p.resolve(p.kind === "terminal" ? undefined : null);
+		if (state.sock === sock) state.sock = null;
+		// Do NOT resolve pending dialogs here. The server re-attaches by key on
+		// hello, and the answer often still arrives through the reconnected
+		// socket. Nulling everything out is what made quizzes come back
+		// "skipped/empty" — the user never cancelled; the pipe hiccuped.
+		scheduleReconnect(state);
 	});
 	sock.unref();
 }
 
+/** Retry the socket forever, gently: 0.25s doubling to a 5s cap. Unref'd, so
+ *  retrying never keeps a shutting-down pi alive. */
+function scheduleReconnect(state: BridgeState): void {
+	if (state.reconnectTimer) return;
+	const attempt = ++state.connectFailures;
+	const delay = Math.min(5000, 250 * 2 ** Math.min(attempt - 1, 4));
+	const timer = setTimeout(() => {
+		state.reconnectTimer = undefined;
+		connect(state);
+	}, delay);
+	timer.unref?.();
+	state.reconnectTimer = timer;
+}
+
 function send(state: BridgeState, msg: unknown): void {
-	if (state.sock && !state.sock.destroyed) state.sock.write(`${JSON.stringify(msg)}\n`);
+	if (state.sock && !state.sock.destroyed) {
+		state.sock.write(`${JSON.stringify(msg)}\n`);
+	} else if ((msg as any)?.t === "ui_close") {
+		// A card we closed while disconnected: queue it so the page isn't left
+		// with a ghost quiz after the socket returns.
+		state.outbox.push(msg as Record<string, unknown>);
+	}
 }
 
 function cancelled(p: Pending): unknown {
@@ -191,18 +240,7 @@ function toAskAnswers(tool: RunningTool, raw: any) {
 function nativeQuestion(state: BridgeState, tool: RunningTool): Promise<unknown> {
 	const uid = `q${++state.seq}`;
 	tool.answered = true;
-	return new Promise((resolve) => {
-		state.pending.set(uid, {
-			kind: tool.toolName,
-			toolCallId: tool.id,
-			resolve: (raw) => {
-				if (!state.pending.has(uid)) return;
-				state.pending.delete(uid);
-				send(state, { t: "ui_close", uid });
-				if (raw == null) return resolve(null);
-				resolve(tool.toolName === "quiz" ? toQuizResponse(tool, raw) : toAskAnswers(tool, raw));
-			},
-		});
+	const announce = () =>
 		send(state, {
 			t: "ui_open",
 			uid,
@@ -211,6 +249,34 @@ function nativeQuestion(state: BridgeState, tool: RunningTool): Promise<unknown>
 			args: tool.args,
 			displayOptions: tool.displayOptions ?? null,
 		});
+	return new Promise((resolve) => {
+		state.pending.set(uid, {
+			kind: tool.toolName,
+			toolCallId: tool.id,
+			announce,
+			resolve: (raw) => {
+				if (!state.pending.has(uid)) return;
+				state.pending.delete(uid);
+				send(state, { t: "ui_close", uid });
+				if (raw == null) return resolve(null);
+				const response = tool.toolName === "quiz" ? toQuizResponse(tool, raw) : toAskAnswers(tool, raw);
+				// A selection that maps to zero answers is a display-order mismatch,
+				// not an answer. Hand back null (the quiz re-asks, honestly labelled)
+				// rather than report "answered, selected nothing" — that false empty
+				// is exactly what made quizzes look broken.
+				if (
+					tool.toolName === "quiz" &&
+					!response.dontKnow &&
+					Array.isArray(raw?.selected) &&
+					raw.selected.length > 0 &&
+					response.answers.length === 0
+				) {
+					return resolve(null);
+				}
+				resolve(response);
+			},
+		});
+		announce();
 	});
 }
 
@@ -271,7 +337,7 @@ function terminalPopup(state: BridgeState, ui: any, factory: any, contextToolCal
 		const schedule = () => {
 			if (!timer) timer = setTimeout(render, 16);
 		};
-		const done = (result: unknown) => {
+	const done = (result: unknown) => {
 			if (closed) return;
 			closed = true;
 			state.pending.delete(uid);
@@ -284,8 +350,13 @@ function terminalPopup(state: BridgeState, ui: any, factory: any, contextToolCal
 			send(state, { t: "ui_close", uid });
 			resolve(result);
 		};
+		const open = () => {
+			send(state, { t: "ui_open", uid, kind: "terminal", toolCallId: contextToolCallId, lines: [] });
+			render();
+		};
 		state.pending.set(uid, {
 			kind: "terminal",
+			announce: open,
 			resolve: done,
 			key: (data) => {
 				try {
@@ -309,8 +380,7 @@ function terminalPopup(state: BridgeState, ui: any, factory: any, contextToolCal
 			.then((created: any) => {
 				component = created;
 				if (closed) return;
-				send(state, { t: "ui_open", uid, kind: "terminal", toolCallId: contextToolCallId, lines: [] });
-				render();
+				open();
 			})
 			.catch(() => done(undefined));
 	});
@@ -337,7 +407,13 @@ function patchUi(state: BridgeState, ctx: any): void {
 
 	const originalCustom = typeof ui.custom === "function" ? ui.custom.bind(ui) : undefined;
 	ui.custom = async (factory: any, options: any) => {
-		if (!state.sock) return originalCustom ? originalCustom(factory, options) : undefined;
+		if (!state.sock) {
+			// The socket can be mid-reconnect (the server re-attaches by key on
+			// hello). Wait briefly instead of instantly cancelling — an instant
+			// undefined here is what made quizzes come back "empty".
+			const back = await waitFor(() => state.sock, 8000);
+			if (!back) return originalCustom ? originalCustom(factory, options) : undefined;
+		}
 		const question = latestTool(state, (t) => QUESTION_TOOLS.has(t.toolName) && !t.answered);
 		if (question) {
 			// quiz shuffles its options and announces the shown order just before

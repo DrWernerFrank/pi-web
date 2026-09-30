@@ -1878,13 +1878,20 @@ function resetText(iso) {
 	return `resets ${d.toLocaleDateString(undefined, { weekday: "short" })} ${time}`;
 }
 
+// Meters are rebuilt on every status refresh; remembering the last fill lets the
+// bar glide from where it was (or grow in from empty the first time).
+const meterMemory = new Map();
 function meter(label, percent, detail, title, cls = "") {
 	const p = Math.max(0, Math.min(100, percent ?? 0));
+	const from = meterMemory.get(label) ?? 0;
+	meterMemory.set(label, p);
+	const fill = h("span", { class: "meter-fill", style: { width: `${from}%` } });
+	requestAnimationFrame(() => requestAnimationFrame(() => (fill.style.width = `${p}%`)));
 	return h(
 		"div",
 		{ class: `meter ${cls} ${percent == null ? "unknown" : level(percent)}`, title },
 		h("span", { class: "meter-label" }, label),
-		h("span", { class: "meter-bar" }, h("span", { class: "meter-fill", style: { width: `${p}%` } })),
+		h("span", { class: "meter-bar" }, fill),
 		h("span", { class: "meter-value" }, percent == null ? "?" : `${Math.round(percent)}%`),
 		detail ? h("span", { class: "meter-detail" }, detail) : null,
 	);
