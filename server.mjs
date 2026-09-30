@@ -12,7 +12,7 @@ import { AGY_PREFIX, AgyTail, AntigravityIndex, findAntigravityDir, readArtifact
 import { AntigravityLive, antigravityAppExe } from "./lib/antigravity-live.mjs";
 import { Bridge } from "./lib/bridge.mjs";
 import { loadConfig } from "./lib/config.mjs";
-import { configureGemini, geminiRead, geminiStatus, startGeminiLogin } from "./lib/gemini.mjs";
+import { readImage as claudeReadImage, visionStatus } from "./lib/vision.mjs";
 import { ModelCatalog } from "./lib/models.mjs";
 import { PiProcess } from "./lib/pi-process.mjs";
 import { SessionIndex, SessionTail, readFullEntry, readImage } from "./lib/sessions.mjs";
@@ -118,8 +118,6 @@ const isFile = (p) => {
 const index = new SessionIndex(config.sessionsDir);
 const models = new ModelCatalog(config.agentDir);
 index.contextWindowFor = (key) => models.contextWindow(key);
-configureGemini({ env: config.env, root: config.root });
-
 // Archived chats: a small list in ~/.cache/pi-web/archived.json. Archiving
 // hides a chat from the sidebar (until “Archived” is toggled or you search)
 // without touching pi's or Antigravity's files.
@@ -1000,12 +998,7 @@ async function handleApiPost(route, body) {
 			fs.writeFileSync(file, buffer);
 			return { ok: true, path: file, name: path.basename(file) };
 		}
-		case "/api/gemini/login": {
-			const state = await startGeminiLogin();
-			if (state.error) throw new HttpError(502, state.error);
-			return { ok: true, ...state };
-		}
-		case "/api/gemini/read": {
+		case "/api/vision/read": {
 			const { session, ref, path: filePath, name, data, mimeType, prompt, model } = body;
 			let image;
 			let mime = typeof mimeType === "string" && /^image\/.+$/.test(mimeType) ? mimeType : "";
@@ -1036,7 +1029,9 @@ async function handleApiPost(route, body) {
 				mime = { ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp", ".gif": "image/gif" }[path.extname(p).toLowerCase()] || "image/png";
 			} else throw new HttpError(400, "Nothing to read: no image");
 			try {
-				const out = await geminiRead({ image, mimeType: mime, prompt, model });
+				// Claude Sonnet 5.5 via Claude Code — same login and subscription
+				// quota that runs the claude-bridge models. No extra auth.
+				const out = await claudeReadImage({ image, mimeType: mime, prompt, model });
 				return { ok: true, ...out };
 			} catch (err) {
 				throw new HttpError(502, String(err.message || err));
@@ -1207,8 +1202,8 @@ function handleApiGet(req, res, url) {
 			if (!agyLive) return sendJson(res, 200, { installed: false });
 			return agyLive.quota({ force: url.searchParams.get("force") === "1" }).then((q) => sendJson(res, 200, { installed: true, ...q }));
 		}
-		case "/api/gemini/status":
-			return sendJson(res, 200, geminiStatus());
+		case "/api/vision/status":
+			return sendJson(res, 200, visionStatus());
 		case "/api/agy/artifact": {
 			const meta = agy && metaFor(session);
 			const text = meta ? readArtifact(agyDir, meta.uuid, url.searchParams.get("name") || "") : undefined;

@@ -165,11 +165,11 @@ async function copy(text, button) {
 	}
 }
 
-const GEMINI_DEFAULT_PROMPT = "Read this image: transcribe any text it contains, then describe what it shows.";
+const VISION_DEFAULT_PROMPT = "Read this image: transcribe any text it contains, then describe what it shows.";
 
 /** What the read endpoint needs for a given image src: a session ref, a file
  *  path, an embed name, or inline data. External URLs can't be read. */
-function geminiTarget(src) {
+function visionTarget(src) {
 	if (!src) return null;
 	if (src.startsWith("data:")) {
 		const m = /^data:(image\/[\w.+-]+);base64,(.*)$/s.exec(src);
@@ -186,40 +186,31 @@ function geminiTarget(src) {
 
 function lightbox(src, alt) {
 	const box = $("#lightbox");
-	const target = geminiTarget(src);
+	const target = visionTarget(src);
 	const img = h("img", { src, alt: alt || "" });
-	box.replaceChildren(h("div", { class: "lb-frame" }, img, target ? geminiPanel(target) : ""));
+	box.replaceChildren(h("div", { class: "lb-frame" }, img, target ? visionPanel(target) : ""));
 	box.hidden = false;
 }
 
-/** Side panel in the lightbox: read the image with Gemini (any model can't see
- *  images — Gemini can, on the Google-account subscription). */
-function geminiPanel(target) {
-	const prompt = h("input", { class: "lb-prompt", type: "text", value: GEMINI_DEFAULT_PROMPT, dir: "auto" });
-	const read = h("button", { class: "btn primary small lb-read", type: "button" }, h("span", { html: icon("sparkles") }), "Read with Gemini");
+/** Side panel in the lightbox: read the image with Claude Sonnet 5.5 (models
+ *  that can't see images get eyes; ones that can get a second opinion). */
+function visionPanel(target) {
+	const prompt = h("input", { class: "lb-prompt", type: "text", value: VISION_DEFAULT_PROMPT, dir: "auto" });
+	const read = h("button", { class: "btn primary small lb-read", type: "button" }, h("span", { html: icon("sparkles") }), "Read with Claude");
 	const meta = h("div", { class: "lb-model" });
 	const out = h("div", { class: "lb-result", hidden: true });
-	const loginRow = h(
-		"button",
-		{ class: "btn ghost small", type: "button", onclick: () => geminiLoginModal() },
-		h("span", { html: icon("globe") }),
-		"Log in to Gemini…",
-	);
-	loginRow.hidden = true;
 	read.onclick = async () => {
 		read.disabled = true;
-		loginRow.hidden = true;
 		out.hidden = false;
-		out.replaceChildren(h("div", { class: "live-row" }, h("span", { class: "spinner" }), "Reading with Gemini…"));
+		out.replaceChildren(h("div", { class: "live-row" }, h("span", { class: "spinner" }), "Reading with Claude…"));
 		meta.textContent = "";
 		try {
-			const r = await post("/api/gemini/read", { ...target, prompt: prompt.value.trim() || undefined });
-			meta.textContent = r.model || "";
+			const r = await post("/api/vision/read", { ...target, prompt: prompt.value.trim() || undefined });
+			meta.textContent = r.model || "Claude";
 			out.replaceChildren(renderInto(h("div", { class: "md" }), String(r.text || ""), { sessionId: target.session }));
 			out.append(h("button", { class: "meta-btn", type: "button", onclick: (e) => copy(r.text, e.currentTarget) }, h("span", { html: icon("copy") }), "Copy"));
 		} catch (err) {
 			out.replaceChildren(h("div", { class: "msg-error" }, h("span", { html: icon("alert") }), h("span", {}, err.message)));
-			if (/no Gemini auth|log in|Log in/i.test(err.message)) loginRow.hidden = false;
 		} finally {
 			read.disabled = false;
 		}
@@ -233,95 +224,12 @@ function geminiPanel(target) {
 	return h(
 		"aside",
 		{ class: "lb-panel" },
-		h("div", { class: "lb-head" }, h("span", { class: "lb-title" }, h("span", { html: icon("sparkles") }), "Gemini"), h("span", { class: "lb-note" }, "reads images your chat model can’t see")),
+		h("div", { class: "lb-head" }, h("span", { class: "lb-title" }, h("span", { html: icon("sparkles") }), "Claude vision"), h("span", { class: "lb-note" }, "Sonnet 5.5 · reads images your chat model can’t see")),
 		prompt,
 		read,
-		loginRow,
 		meta,
 		out,
 	);
-}
-
-/** ⋯ → Log in to Gemini: status, browser login, polling until it lands. */
-async function geminiLoginModal() {
-	const statusLine = h("div", { class: "gemini-status" });
-	const link = h("a", { class: "btn primary small", target: "_blank", rel: "noopener", hidden: true });
-	const startBtn = h("button", { class: "btn primary", type: "button" }, "Log in with Google");
-	const body = h(
-		"div",
-		{ class: "gemini-login" },
-		h("p", { class: "gemini-expl" }, "One browser login with the Google account of your Gemini subscription (Google AI Pro / Code Assist). No API key. The login is saved in ~/.gemini/oauth_creds.json and shared with the gemini CLI."),
-		statusLine,
-		startBtn,
-		link,
-	);
-	const p = modal("Gemini", body, [{ label: "Close", value: null }]);
-	let stop = false;
-	p.then(() => (stop = true));
-	const paint = (st) => {
-		const l = st.login || {};
-		if (st.auth === "subscription" && st.usable !== false) {
-			statusLine.textContent = `✓ Ready — your Google account (${prettyPath(st.loginPath || "")}).`;
-			startBtn.hidden = true;
-			link.hidden = true;
-		} else if (st.auth === "subscription" && st.usable === false) {
-			// A Gemini CLI login exists, but it cannot read images (no consumer
-			// scope and no Code Assist project on the account). Say so instead of
-			// a false "Ready" — the login button below is what fixes it.
-			statusLine.textContent = `A Gemini CLI login exists (${prettyPath(st.loginPath || "")}), but it can't read images. Log in below to grant image reading — it takes one click and replaces nothing.`;
-			startBtn.hidden = false;
-			startBtn.textContent = "Log in with Google";
-		} else if (st.auth === "login-only") {
-			statusLine.textContent = "A Gemini CLI login exists, but it can't read images (no consumer scope, no Code Assist project). Log in below — one click — to grant image reading.";
-			startBtn.hidden = false;
-			startBtn.textContent = "Log in with Google";
-		} else if (st.auth === "api-key") {
-			statusLine.textContent = "✓ Ready — using GEMINI_API_KEY. Subscription login would replace it.";
-		} else if (l.pending) {
-			statusLine.textContent = "Waiting for the login to finish in the other tab…";
-			startBtn.hidden = true;
-			if (l.url && link.hidden) {
-				link.hidden = false;
-				link.href = l.url;
-				link.textContent = "Open the Google login page";
-			}
-		} else if (l.error) {
-			statusLine.textContent = `Login failed: ${l.error}`;
-		} else {
-			statusLine.textContent = "Not logged in yet.";
-		}
-	};
-	const poll = async () => {
-		try {
-			paint(await getJson("/api/gemini/status"));
-		} catch {
-			/* server hiccup: keep the last state */
-		}
-		const txt = document.querySelector(".gemini-status")?.textContent || "";
-		if (!stop && !txt.startsWith("✓")) setTimeout(poll, 1500);
-	};
-	poll();
-	startBtn.onclick = async () => {
-		startBtn.disabled = true;
-		try {
-			const r = await post("/api/gemini/login");
-			if (r.url) {
-				link.hidden = false;
-				link.href = r.url;
-				link.textContent = "Open the Google login page";
-				try {
-					window.open(r.url, "_blank", "noopener");
-				} catch {
-					/* popup blocked: the link is right there */
-				}
-			}
-		} catch (err) {
-			statusLine.textContent = `Login failed: ${err.message}`;
-		} finally {
-			startBtn.disabled = false;
-		}
-	};
-	return p;
 }
 
 // ── helpers ─────────────────────────────────────────────────────────────────
@@ -1198,7 +1106,6 @@ function openMenu(anchor) {
 					? item("Antigravity: chat about this project", "sparkles", () => newChat(null, "antigravity"))
 					: null,
 				h("div", { class: "menu-sep" }),
-				item("Gemini…", "sparkles", () => geminiLoginModal()),
 			];
 	const content = h(
 		"div",
@@ -2702,7 +2609,7 @@ function wire() {
 		conv.scrollToBottom(true);
 	};
 	$("#lightbox").onclick = (e) => {
-		// Clicks inside the Gemini side panel are its own (its button opens modals).
+		// Clicks inside the vision side panel are its own.
 		if (e.target.closest(".lb-panel")) return;
 		$("#lightbox").hidden = true;
 	};
