@@ -19,6 +19,8 @@ A browser GUI for the [pi](https://github.com/earendil-works/pi) coding agent. I
 
 If Antigravity is installed (its data is in `C:\Users\<you>\.gemini\antigravity`), its conversations appear in the sidebar under **Antigravity**, next to your pi sessions.
 
+- **Search old chats**: the sidebar's search box (top left, Ctrl+K) filters by name **and digs through what was said** — matches inside messages come back with a snippet and the match marked, so you can find "that thing about deployment" from weeks ago. It searches pi sessions and Antigravity conversations.
+- **Right-click a chat**: Archive (hides it from the list — still findable by search, and a sidebar-foot "Archived" toggle shows them), Unarchive, Copy file path, and **Delete…** (permanently removes the session file, after a confirm; a pi still open on that chat in a terminal must be closed first or the file may reappear). Antigravity conversations can be archived here but deleted only in the Antigravity app.
 - **Reading** works whether the app is open or not. Messages, thinking, tool calls with their output and images, subagent messages and context checkpoints all render like pi sessions, and update live while Antigravity works.
 - **Artifacts** (plans, write-ups: the markdown files Antigravity writes) are listed above the message box. Clicking one opens it in the side panel, and it refreshes while Antigravity edits it.
 - **Subagents**: Antigravity's subagents are nested under their parent and show in the running strip. **Watch** opens them in the side panel.

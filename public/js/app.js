@@ -52,8 +52,12 @@ const S = {
 		fontSize: 17,
 		sidebar: true,
 		showSubagents: false,
+		showArchived: false,
 		...storage("pi-web:settings", {}),
 	},
+	// Full-text search results (id → {count, snippets}) from /api/search;
+	// filled as you type in the sidebar's search box.
+	searchHits: new Map(),
 	sessions: new Map(),
 	byFile: new Map(),
 	usage: null,
@@ -666,7 +670,12 @@ function renderSessionList() {
 		if (!childrenOf.has(s.parentId)) childrenOf.set(s.parentId, []);
 		childrenOf.get(s.parentId).push(s);
 	}
-	const visible = all.filter((s) => (q ? matchesSearch(s, q) : !s.parentId || S.settings.showSubagents || s.id === S.current));
+	const visible = all.filter((s) => {
+		if (q) return matchesSearch(s, q) || S.searchHits.has(s.id); // title match or a full-text hit
+		// Archived chats stay out of the list — except the one you're reading, or when "Archived" is on.
+		if (s.archived && !S.settings.showArchived && s.id !== S.current) return false;
+		return !s.parentId || S.settings.showSubagents || s.id === S.current;
+	});
 	const groups = new Map();
 	for (const s of visible) {
 		const key = isAgy(s) ? `antigravity:${s.cwd || ""}` : s.cwd || "";
@@ -684,7 +693,7 @@ function renderSessionList() {
 
 	const frag = document.createDocumentFragment();
 	if (!ordered.length) {
-		frag.append(h("div", { class: "list-empty" }, q ? "No sessions match." : "No pi sessions found yet."));
+		frag.append(h("div", { class: "list-empty" }, q ? "No chats match — neither by name nor inside their messages." : "No pi sessions found yet."));
 	}
 	for (const group of ordered) {
 		const collapsedKey = `pi-web:group:${group.cwd}`;
@@ -736,6 +745,7 @@ function renderSessionList() {
 	}
 	list.replaceChildren(frag);
 	$("#toggle-subagents").classList.toggle("on", S.settings.showSubagents);
+	$("#toggle-archived").classList.toggle("on", S.settings.showArchived);
 }
 
 function sessionRow(s, children) {
@@ -762,18 +772,35 @@ function sessionRow(s, children) {
 		: children.length
 			? h("span", { class: "row-kids" }, ` · ${children.length} subagent${children.length > 1 ? "s" : ""}`)
 			: null;
+	const q = S.search.trim();
+	const hit = q ? S.searchHits.get(s.id) : null;
+	// A full-text hit shows where the words were found, with the match marked.
+	const snippet = hit
+		? h("div", { class: "row-snippet" },
+				h("span", { class: "snippet-role" }, hit.snippets[0]?.role === "user" ? "you: " : hit.snippets[0]?.role === "pi" ? "pi: " : ""),
+				h("span", { class: "snippet-text", dir: textDir(hit.snippets[0]?.text || "") || "auto" }, ...highlightParts(hit.snippets[0]?.text || "", q)),
+			)
+		: null;
+	const archBadge = s.archived && !q ? h("span", { class: "row-kids" }, " · archived") : q && s.archived ? h("span", { class: "arch-chip" }, "archived") : null;
 	const row = h(
 		"a",
-		{ class: `session-row${s.id === S.current ? " active" : ""}${s.parentId ? " child" : ""}`, href: `#/s/${encodeURIComponent(s.id)}`, title },
+		{ class: `session-row${s.id === S.current ? " active" : ""}${s.parentId ? " child" : ""}${hit ? " hit" : ""}`, href: `#/s/${encodeURIComponent(s.id)}`, title },
 		h(
 			"div",
 			{ class: "row-main" },
 			s.parentId ? h("span", { class: "row-agent", html: icon("bot") }) : null,
 			h("span", { class: "row-title", dir: textDir(title) || "auto" }, s.parentId && s.agentName ? `${s.agent || "agent"} · ${s.agentName}` : title),
 			badge,
+			archBadge,
 		),
 		h("div", { class: "row-sub" }, sub, kids),
+		snippet,
 	);
+	// Right-click: delete / archive / copy path.
+	row.addEventListener("contextmenu", (e) => {
+		e.preventDefault();
+		openSessionMenu(s, e.clientX, e.clientY);
+	});
 	return row;
 }
 
@@ -924,6 +951,98 @@ function openPopover(anchor, content, cls = "") {
 		document.addEventListener("mousedown", off);
 	});
 	return popover;
+}
+
+/** Split text into parts around (case-insensitive) matches of q, for marking. */
+function highlightParts(text, q) {
+	if (!q) return [text];
+	const out = [];
+	const lower = text.toLowerCase();
+	const needle = q.toLowerCase();
+	let at = 0;
+	for (;;) {
+		const found = lower.indexOf(needle, at);
+		if (found < 0) break;
+		if (found > at) out.push(text.slice(at, found));
+		out.push(h("mark", {}, text.slice(found, found + needle.length)));
+		at = found + needle.length;
+	}
+	if (at < text.length) out.push(text.slice(at));
+	return out.length ? out : [text];
+}
+
+/** A popover that opens at a point (right-click menus) instead of under a button. */
+function openPopoverAt(x, y, content, cls = "") {
+	closePopover();
+	popover = h("div", { class: `popover ${cls}` }, content);
+	document.body.append(popover);
+	const w = popover.offsetWidth;
+	const hgt = popover.offsetHeight;
+	popover.style.top = `${Math.max(8, Math.min(y, window.innerHeight - hgt - 8))}px`;
+	popover.style.left = `${Math.max(8, Math.min(x, window.innerWidth - w - 8))}px`;
+	setTimeout(() => {
+		const off = (e) => {
+			if (popover && !popover.contains(e.target)) {
+				closePopover();
+				document.removeEventListener("mousedown", off);
+			}
+		};
+		document.addEventListener("mousedown", off);
+	});
+	return popover;
+}
+
+// ── chat menu: right-click on a session ──────────────────────────────────────
+
+async function archiveSession(s, on) {
+	try {
+		await post("/api/session/archive", { session: s.id, archived: on });
+		toast(on ? "Archived — hidden from the list (find it via search, or toggle “Archived”)." : "Back in the list.", "info");
+	} catch (err) {
+		toast(err.message, "error");
+	}
+}
+
+async function confirmDeleteSession(s) {
+	const ok = await confirmModal(
+		"Delete this chat?",
+		`“${sessionTitle(s)}” will be deleted permanently, together with its session file. This cannot be undone. If pi still has this session open in a terminal, close it first or the file may come back.`,
+		"Delete",
+	);
+	if (!ok) return;
+	try {
+		await post("/api/session/delete", { session: s.id });
+		toast("Chat deleted.", "info");
+		if (S.current === s.id) navigate(null);
+	} catch (err) {
+		toast(err.message, "error");
+	}
+}
+
+function openSessionMenu(s, x, y) {
+	const entry = (label, iconName, fn, danger) =>
+		h(
+			"button",
+			{
+				class: `menu-item${danger ? " danger" : ""}`,
+				type: "button",
+				onclick: () => {
+					closePopover();
+					fn();
+				},
+			},
+			h("span", { html: icon(iconName) }),
+			label,
+		);
+	const items = [entry("Open", "external", () => navigate(s.id))];
+	if (!isAgy(s) && s.file) items.push(entry("Copy file path", "copy", () => copy(s.file)));
+	items.push(entry(s.archived ? "Unarchive" : "Archive", "archive", () => archiveSession(s, !s.archived)));
+	if (isAgy(s)) {
+		items.push(h("div", { class: "menu-note" }, "Deleting an Antigravity conversation happens in the Antigravity app."));
+	} else {
+		items.push(entry("Delete…", "trash", () => confirmDeleteSession(s), true));
+	}
+	openPopoverAt(x, y, h("div", { class: "menu" }, items));
 }
 
 function openMenu(anchor) {
@@ -1976,6 +2095,28 @@ function loadDraft() {
 	autoGrow();
 }
 
+/** Full-text search over all chats (server-side). Runs while you type; the
+ *  results merge into the sidebar's list, with snippets under each hit. */
+const fetchSearchHits = debounce(async () => {
+	const q = S.search.trim();
+	if (q.length < 2) {
+		if (S.searchHits.size) {
+			S.searchHits = new Map();
+			renderSessionList();
+		}
+		return;
+	}
+	try {
+		const data = await getJson(`/api/search?q=${encodeURIComponent(q)}`);
+		// A later keystroke may have won the race; only apply the freshest answer.
+		if (S.search.trim() !== q) return;
+		S.searchHits = new Map((data.results || []).map((r) => [r.id, r]));
+		} catch {
+		// the server will say so on the next word
+	}
+	renderSessionList();
+}, 300);
+
 let warmed = null;
 function prewarm() {
 	if (!S.current || isAgy(S.meta) || hasProcess() || warmed === S.current || isExternallyActive(S.meta) || !S.server.piBin) return;
@@ -2371,6 +2512,12 @@ function wire() {
 		setSetting("showSubagents", !S.settings.showSubagents);
 		renderSessionList();
 	};
+	$("#toggle-archived").innerHTML = `${icon("archive")}<span>Archived</span>`;
+	$("#toggle-archived").title = "Show archived chats";
+	$("#toggle-archived").onclick = () => {
+		setSetting("showArchived", !S.settings.showArchived);
+		renderSessionList();
+	};
 	$("#scrim").onclick = () => setSidebarOpenMobile(false);
 
 	const search = $("#search");
@@ -2379,6 +2526,7 @@ function wire() {
 		debounce(() => {
 			S.search = search.value;
 			renderSessionList();
+			fetchSearchHits();
 		}, 80),
 	);
 

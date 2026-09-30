@@ -387,6 +387,59 @@ a {
 	font-weight: 500;
 	color: var(--faint);
 }
+.menu-item.danger {
+	color: var(--bad);
+}
+.menu-item.danger .icon {
+	color: var(--bad);
+}
+.menu-note {
+	padding: 8px 12px;
+	font-size: 11.5px;
+	color: var(--faint);
+	line-height: 1.4;
+}
+.session-row.hit .row-title {
+	color: var(--text);
+}
+.row-snippet {
+	display: flex;
+	gap: 6px;
+	align-items: baseline;
+	font-size: 11.5px;
+	color: var(--muted);
+	padding: 1px 2px 0;
+	line-height: 1.35;
+}
+.snippet-role {
+	flex: none;
+	font-weight: 700;
+	font-size: 10.5px;
+	color: var(--faint);
+	text-transform: uppercase;
+	letter-spacing: 0.04em;
+}
+.snippet-text {
+	min-width: 0;
+	overflow: hidden;
+	display: -webkit-box;
+	-webkit-line-clamp: 2;
+	-webkit-box-orient: vertical;
+}
+.row-snippet mark {
+	background: var(--accent-soft);
+	color: var(--accent-text);
+	border-radius: 3px;
+	padding: 0 1px;
+}
+.arch-chip {
+	flex: none;
+	font-size: 10px;
+	padding: 1px 6px;
+	border-radius: 5px;
+	background: var(--bg-soft);
+	color: var(--muted);
+}
 .session-row {
 	display: block;
 	padding: 7px 10px;

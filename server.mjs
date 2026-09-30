@@ -120,6 +120,28 @@ const models = new ModelCatalog(config.agentDir);
 index.contextWindowFor = (key) => models.contextWindow(key);
 configureGemini({ env: config.env, root: config.root });
 
+// Archived chats: a small list in ~/.cache/pi-web/archived.json. Archiving
+// hides a chat from the sidebar (until “Archived” is toggled or you search)
+// without touching pi's or Antigravity's files.
+const ARCHIVED_FILE = path.join(os.homedir(), ".cache", "pi-web", "archived.json");
+function readArchived() {
+	try {
+		const raw = JSON.parse(fs.readFileSync(ARCHIVED_FILE, "utf8"));
+		return Array.isArray(raw) ? new Set(raw) : new Set();
+	} catch {
+		return new Set();
+	}
+}
+const archived = readArchived();
+function writeArchived() {
+	try {
+		fs.mkdirSync(path.dirname(ARCHIVED_FILE), { recursive: true });
+		fs.writeFileSync(ARCHIVED_FILE, JSON.stringify([...archived], null, 2));
+	} catch {
+		// best effort: hiding is cosmetic
+	}
+}
+
 // Which git commit this build is (the folder is a git repo — see README's
 // "Version control"). Shown in the ⋯ menu and /api/health so "which build is
 // running?" is always answerable; a server restarted from old code says so.
@@ -148,6 +170,108 @@ async function awaitAgyConversation(id, ms = 10_000) {
 		await new Promise((r) => setTimeout(r, 700));
 	}
 	return false;
+}
+
+// ── full-text search over old chats ──────────────────────────────────────
+// The sidebar's search box filters by title; this digs through what was
+// actually said. Text is extracted once per file version and cached, so
+// typing stays fast even with a few hundred sessions.
+
+const SEARCH_CACHE = new Map(); // file -> { mtimeMs, size, segments }
+const SEARCH_CACHE_MAX = 300;
+const SEARCH_MAX_FILE = 5 * 1024 * 1024;
+const SEARCH_MAX_SEGMENTS = 4000;
+
+/** Chat text as [{role, text}] — user + assistant messages only. */
+function extractSegments(file, kind) {
+	let raw;
+	try {
+		raw = fs.readFileSync(file, "utf8");
+	} catch {
+		return [];
+	}
+	const segments = [];
+	for (const line of raw.split("\n")) {
+		if (!line || segments.length >= SEARCH_MAX_SEGMENTS) continue; // not JSON.parse per char: skip empties first
+		let j;
+		try {
+			j = JSON.parse(line);
+		} catch {
+			continue;
+		}
+		if (kind === "agy") {
+			// Antigravity transcript lines: {source, content}
+			const role = j.source === "USER_EXPLICIT" ? "user" : j.source === "MODEL" ? "pi" : null;
+			if (role && typeof j.content === "string" && j.content.trim()) segments.push({ role, text: j.content });
+			continue;
+		}
+		// pi session lines: {type:"message", message:{role, content}}
+		if (j.type !== "message" || !j.message) continue;
+		const role = j.message.role === "user" ? "user" : j.message.role === "assistant" ? "pi" : null;
+		if (!role) continue;
+		const c = j.message.content;
+		const text = Array.isArray(c)
+			? c.filter((b) => b && b.type === "text" && typeof b.text === "string").map((b) => b.text).join("\n")
+			: typeof c === "string"
+				? c
+				: "";
+		if (text.trim()) segments.push({ role, text });
+	}
+	return segments;
+}
+
+const SNIPPET_PAD = 70;
+function snippetAround(text, at, len) {
+	const start = Math.max(0, at - SNIPPET_PAD);
+	const end = Math.min(text.length, at + len + SNIPPET_PAD);
+	return (start > 0 ? "…" : "") + text.slice(start, end).replace(/\s+/g, " ").trim() + (end < text.length ? "…" : "");
+}
+
+async function searchSessions(q) {
+	const needle = q.toLowerCase();
+	const out = [];
+	const consider = (meta, file, kind) => {
+		if (!file) return;
+		let stat;
+		try {
+			stat = fs.statSync(file);
+		} catch {
+			return;
+		}
+		if (!stat.isFile() || stat.size === 0 || stat.size > SEARCH_MAX_FILE) return;
+		let entry = SEARCH_CACHE.get(file);
+		if (!entry || entry.mtimeMs !== stat.mtimeMs || entry.size !== stat.size) {
+			entry = { mtimeMs: stat.mtimeMs, size: stat.size, segments: extractSegments(file, kind) };
+			SEARCH_CACHE.set(file, entry);
+			if (SEARCH_CACHE.size > SEARCH_CACHE_MAX) SEARCH_CACHE.delete(SEARCH_CACHE.keys().next().value);
+		}
+		let count = 0;
+		const snippets = [];
+		for (const seg of entry.segments) {
+			const hay = seg.text.toLowerCase();
+			let at = hay.indexOf(needle);
+			while (at !== -1) {
+				count++;
+				if (snippets.length < 3) snippets.push({ role: seg.role, text: snippetAround(seg.text, at, needle.length) });
+				if (count >= 500) break;
+				at = hay.indexOf(needle, at + needle.length);
+			}
+			if (count >= 500) break;
+		}
+		if (count) out.push({ id: meta.id, count, snippets, lastActivity: meta.lastActivity || null });
+	};
+	for (const meta of index.list()) consider(meta, meta.file, "pi");
+	if (agy) {
+		for (const meta of agy.list()) {
+			try {
+				consider(meta, path.join(agy.brainDir(meta.uuid), ".system_generated", "logs", "transcript.jsonl"), "agy");
+			} catch {
+				// transcript not there yet
+			}
+		}
+	}
+	out.sort((a, b) => b.count - a.count || Date.parse(b.lastActivity || "") - Date.parse(a.lastActivity || ""));
+	return out.slice(0, 40);
 }
 
 const isAgy = (id) => typeof id === "string" && id.startsWith(AGY_PREFIX);
@@ -205,11 +329,15 @@ function metaFor(id) {
 }
 
 function decorated(meta) {
-	return meta.kind === "antigravity" ? meta : index.decorate(meta);
+	const m = meta.kind === "antigravity" ? meta : index.decorate(meta);
+	m.archived = archived.has(m.id);
+	return m;
 }
 
 function allSessions() {
-	return agy ? [...index.list(), ...agy.list()] : index.list();
+	const out = agy ? [...index.list(), ...agy.list()] : index.list();
+	for (const s of out) s.archived = archived.has(s.id);
+	return out;
 }
 const tails = new Map(); // file -> { tail, refs, timer, watcher }
 const procs = new Map(); // sessionId -> PiProcess
@@ -899,6 +1027,44 @@ async function handleApiPost(route, body) {
 			else throw new HttpError(400, "Unknown action");
 			return { ok: true };
 		}
+		case "/api/session/archive": {
+			const { session } = body;
+			const on = body.archived !== false;
+			const meta = metaFor(session);
+			if (!meta) throw new HttpError(404, "Unknown session");
+			if (on) archived.add(session);
+			else archived.delete(session);
+			writeArchived();
+			const fresh = metaFor(session);
+			if (fresh) {
+				fresh.archived = archived.has(session);
+				broadcastAll("session_upsert", fresh);
+			}
+			return { ok: true, archived: archived.has(session) };
+		}
+		case "/api/session/delete": {
+			const { session } = body;
+			if (isAgy(session)) throw new HttpError(400, "Antigravity conversations live in the Antigravity app — archive it here instead, or delete it there.");
+			const meta = index.get(session);
+			if (!meta) throw new HttpError(404, "Unknown session");
+			if (meta.pending) throw new HttpError(409, "pi has not saved this session yet; stop pi first, then delete.");
+			if (!meta.file) throw new HttpError(400, "This session has no file to delete.");
+			const file = path.resolve(meta.file);
+			if (!file.startsWith(path.resolve(config.sessionsDir) + path.sep)) throw new HttpError(403, "Refusing to delete a file outside pi's sessions folder.");
+			const p = procs.get(session);
+			if (p) {
+				// A pi that keeps running would recreate the file on its next message.
+				cancelInteractive(p);
+				p.stopRequested = true;
+				p.stop();
+			}
+			fs.rmSync(file, { force: true });
+			archived.delete(session);
+			writeArchived();
+			index.remove(file); // the watcher would too; do it now
+			broadcastAll("session_remove", { id: session });
+			return { ok: true };
+		}
 		case "/api/process": {
 			const { session, action } = body;
 			if (action === "start") return { ok: true, proc: (await ensureProc(session)).info() };
@@ -972,6 +1138,13 @@ function handleApiGet(req, res, url) {
 			return sendJson(res, 200, { projects: index.projects(), home: os.homedir() });
 		case "/api/usage":
 			return claudeUsage.get({ force: url.searchParams.get("force") === "1" }).then((usage) => sendJson(res, 200, usage));
+		case "/api/search": {
+			const q = (url.searchParams.get("q") || "").trim();
+			if (q.length < 2) return sendJson(res, 200, { q, results: [] });
+			return searchSessions(q)
+				.then((results) => sendJson(res, 200, { q, results }))
+				.catch((err) => sendJson(res, 200, { q, results: [], error: String(err.message || err) }));
+		}
 		case "/api/agy/status": {
 			if (!agyLive) return sendJson(res, 200, { installed: false });
 			return agyLive.quota({ force: url.searchParams.get("force") === "1" }).then((q) => sendJson(res, 200, { installed: true, ...q }));
@@ -1079,7 +1252,7 @@ const server = http.createServer((req, res) => {
 
 // ── startup ─────────────────────────────────────────────────────────────────
 
-index.on("upsert", (meta) => broadcastAll("session_upsert", meta));
+index.on("upsert", (meta) => { meta.archived = archived.has(meta.id); broadcastAll("session_upsert", meta); });
 index.on("remove", (id) => broadcastAll("session_remove", { id }));
 
 function shutdown() {
@@ -1098,7 +1271,7 @@ process.on("SIGHUP", shutdown);
 await index.scan();
 index.watch();
 if (agy) {
-	agy.on("upsert", (meta) => broadcastAll("session_upsert", meta));
+	agy.on("upsert", (meta) => { meta.archived = archived.has(meta.id); broadcastAll("session_upsert", meta); });
 	agy.on("remove", (id) => broadcastAll("session_remove", { id }));
 	await agy.start().catch((err) => console.warn(`[pi-web] Antigravity: ${err.message}`));
 }
