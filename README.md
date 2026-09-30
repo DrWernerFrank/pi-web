@@ -55,6 +55,15 @@ Subagents are spawned with `--no-extensions` and only the extensions backing the
 
 So an agent that needs an image read dispatches a worker/researcher with the path, and the subagent calls `read_image`. A model that can see images itself can call the tool directly too.
 
+## As a Windows app
+
+**“Pi Web” is in your Start menu** — type `pi` after opening it. It opens as its own app window (no browser chrome), with the π icon.
+
+- The shortcut runs `app-launcher.vbs`: it checks the server, starts it inside WSL (hidden) if needed, waits up to two minutes, then opens Chrome in app mode. If it can't come up, it says so instead of failing silently.
+- The icon (`pi-web.ico`, 256/48/32/16, built from the π logo) is also served as `/favicon.ico`, so the app window and tabs use it.
+- To pin it to the taskbar: right-click the Start-menu entry → **Pin to taskbar**. A desktop copy: right-click → Open file location → drag to the Desktop.
+- Re-create the shortcut after moving the folder: `powershell.exe -ExecutionPolicy Bypass -File make-shortcut.ps1` (run from the folder).
+
 ## Start it
 
 **From Windows:** double-click `Pi Web.cmd` (you can drag a shortcut of it to your Desktop or taskbar). It starts pi-web inside WSL, opens your browser, and leaves a window showing the pi-web log and any subagents. You can close that window; pi-web keeps running.

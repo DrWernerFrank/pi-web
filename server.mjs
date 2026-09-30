@@ -1234,7 +1234,7 @@ async function handle(req, res) {
 		if (!base) throw new HttpError(404, "Not found");
 		return serveStatic(req, res, base, rest.join("/"), 86400);
 	}
-	if (/^\/(js|css|img)\//.test(route) || route === "/favicon.svg") return serveStatic(req, res, PUBLIC, route, 0);
+	if (/^\/(js|css|img)\//.test(route) || route === "/favicon.svg" || route === "/favicon.ico") return serveStatic(req, res, PUBLIC, route, 0);
 	throw new HttpError(404, "Not found");
 }
 
