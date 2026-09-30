@@ -24,12 +24,12 @@
 	/* lines */
 	--border: #e7e4dd;
 	--border-strong: #d5d1c7;
-	/* the one accent */
-	--accent: #5b5bd6;
-	--accent-hover: #4a4ac4;
-	--accent-soft: rgba(91, 91, 214, 0.1);
-	--accent-text: #4646b8;
-	--accent-ring: rgba(91, 91, 214, 0.28);
+	/* the one accent: pi's violet, sharpened */
+	--accent: #5438d6;
+	--accent-hover: #472fc0;
+	--accent-soft: rgba(84, 56, 214, 0.09);
+	--accent-text: #4730a8;
+	--accent-ring: rgba(84, 56, 214, 0.3);
 	--on-accent: #ffffff;
 	--user-bg: #ecebfa;
 	--code-bg: #f4f2ed;
@@ -98,12 +98,12 @@
 	--faint: #747783;
 	--border: #25272e;
 	--border-strong: #363842;
-	--accent: #8d8bf6;
-	--accent-hover: #a3a1fa;
-	--accent-soft: rgba(141, 139, 246, 0.15);
-	--accent-text: #b5b3ff;
-	--accent-ring: rgba(141, 139, 246, 0.32);
-	--on-accent: #0f0f1a;
+	--accent: #9d86ff;
+	--accent-hover: #b3a0ff;
+	--accent-soft: rgba(157, 134, 255, 0.16);
+	--accent-text: #c3b4ff;
+	--accent-ring: rgba(157, 134, 255, 0.36);
+	--on-accent: #14101f;
 	--user-bg: #232340;
 	--code-bg: #0e0f12;
 	--code-border: #26282f;
@@ -403,11 +403,12 @@ select:focus-visible {
 /* signature: the π mark wears a soft gradient ring (also on the assistant avatar) */
 .brand-logo,
 .avatar {
-	border: 1.5px solid transparent;
+	border: 2px solid transparent;
 	background:
 		linear-gradient(var(--bg-elev), var(--bg-elev)) padding-box,
-		linear-gradient(140deg, var(--accent), #c98bff 55%, #62b0ff) border-box;
+		linear-gradient(140deg, var(--accent), #c98bff 50%, #62b0ff) border-box;
 	color: var(--accent-text);
+	box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 18%, transparent);
 }
 .brand-logo {
 	display: grid;
@@ -767,6 +768,7 @@ select:focus-visible {
 /* ── top bar ─────────────────────────────────────────────────────────────── */
 
 .topbar {
+	position: relative;
 	display: flex;
 	align-items: center;
 	gap: 8px;
@@ -776,6 +778,17 @@ select:focus-visible {
 	background: color-mix(in srgb, var(--bg) 86%, transparent);
 	backdrop-filter: blur(10px) saturate(1.2);
 	z-index: 5;
+}
+/* signature: a quiet violet stripe — the app's identity line */
+.topbar::after {
+	content: "";
+	position: absolute;
+	inset-inline: 0;
+	bottom: -1px;
+	height: 2px;
+	background: linear-gradient(90deg, transparent 4%, var(--accent) 30%, var(--accent-ring) 60%, transparent 96%);
+	opacity: 0.5;
+	pointer-events: none;
 }
 .topbar-main {
 	flex: 1;
@@ -1005,12 +1018,13 @@ select:focus-visible {
 	gap: 8px;
 }
 .bubble {
-	background: var(--user-bg);
-	border: 1px solid color-mix(in srgb, var(--accent) 14%, transparent);
+	background: linear-gradient(160deg, color-mix(in srgb, var(--accent) 13%, var(--bg-elev)), color-mix(in srgb, var(--accent) 7%, var(--bg-elev)));
+	border: 1px solid color-mix(in srgb, var(--accent) 22%, transparent);
 	border-radius: 16px 16px 5px 16px;
 	padding: 10px 16px;
 	max-width: 86%;
 	min-width: 0;
+	box-shadow: var(--shadow-sm);
 }
 .bubble .md {
 	font-size: calc(var(--reading) - 0.5px);
@@ -2442,9 +2456,22 @@ button.qa-option:hover {
 	padding: 8px;
 	transition: border-color var(--t-fast), box-shadow var(--t-fast);
 }
+.composer::after {
+	content: "";
+	position: absolute;
+	inset: -1px;
+	border-radius: inherit;
+	pointer-events: none;
+	border: 1px solid color-mix(in srgb, var(--accent) 26%, transparent);
+	opacity: 0.45;
+	transition: opacity var(--t-fast);
+}
 .composer:focus-within {
 	border-color: color-mix(in srgb, var(--accent) 60%, var(--border-strong));
 	box-shadow: 0 0 0 3px var(--accent-soft), var(--shadow);
+}
+.composer:focus-within::after {
+	opacity: 1;
 }
 /* signature: while pi works, a thin light travels along the composer's top edge */
 .composer.busy::before {
