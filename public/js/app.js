@@ -714,7 +714,7 @@ function renderSessionList() {
 	const frag = document.createDocumentFragment();
 	if (pinnedRows.length) {
 		frag.append(h("div", { class: "pin-head" }, h("span", { class: "chev", html: icon("pin") }), "Pinned"));
-		for (const s of pinnedRows) frag.append(sessionRow(s, childrenOf.get(s.id) || []));
+		for (const s of pinnedRows) frag.append(sessionRow(s, childrenOf.get(s.id) || [], true));
 	}
 	if (!ordered.length && !pinnedRows.length) {
 		frag.append(h("div", { class: "list-empty" }, q ? "No chats match — neither by name nor inside their messages." : "No chats yet. Hit “New chat” and say something."));
@@ -788,7 +788,7 @@ function renderSessionList() {
 	$("#toggle-archived").classList.toggle("on", S.settings.showArchived);
 }
 
-function sessionRow(s, children) {
+function sessionRow(s, children, inPinBlock = false) {
 	const proc = S.procs.get(s.id);
 	const pins = pinnedIds();
 	const running = proc && proc.state !== "exited" && proc.state !== "stopping";
@@ -827,7 +827,7 @@ function sessionRow(s, children) {
 	const row = h(
 		"a",
 		{
-			class: `session-row${s.id === S.current ? " active" : ""}${s.parentId ? " child" : ""}${hit ? " hit" : ""}${runningSubs ? " kids-live" : ""}${!q && pins.has(s.id) ? " pinned" : ""}`,
+			class: `session-row${s.id === S.current ? " active" : ""}${s.parentId ? " child" : ""}${hit ? " hit" : ""}${runningSubs ? " kids-live" : ""}${inPinBlock ? " pinned" : ""}`,
 			href: `#/s/${encodeURIComponent(s.id)}`,
 			title: [title, [when, sub].filter(Boolean).join(" · ")].join("\n"),
 		},
