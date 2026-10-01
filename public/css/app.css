@@ -3386,6 +3386,56 @@ body.no-session .composer-wrap {
 	text-transform: uppercase;
 	color: var(--muted);
 }
+/* your activity card (tokens / messages / active days) */
+.home-usage.activity {
+	min-width: min(560px, calc(100vw - 48px));
+}
+.activity-hero {
+	display: flex;
+	flex-direction: column;
+	align-items: center;
+	gap: 2px;
+	padding: 4px 0 2px;
+}
+.stat-num.hero {
+	font-size: 30px;
+	font-weight: 750;
+	letter-spacing: -0.02em;
+	color: var(--accent-text);
+	background: linear-gradient(140deg, var(--accent), #c98bff 55%, #62b0ff);
+	background-clip: text;
+	-webkit-background-clip: text;
+	color: transparent;
+	cursor: default;
+}
+.activity-grid {
+	display: grid;
+	grid-template-columns: repeat(4, minmax(96px, 1fr));
+	gap: 10px 22px;
+	width: 100%;
+	padding-top: 8px;
+}
+.activity-grid .stat {
+	display: flex;
+	flex-direction: column;
+	align-items: center;
+	gap: 1px;
+}
+.stat-num {
+	font-size: 17px;
+	font-weight: 650;
+	color: var(--text);
+	font-variant-numeric: tabular-nums;
+}
+.stat-label {
+	font-size: var(--fs-xs);
+	color: var(--muted);
+}
+.activity-foot {
+	font-size: var(--fs-xs);
+	color: var(--faint);
+	padding-top: 6px;
+}
 .home-usage .meter-bar {
 	width: 140px;
 }

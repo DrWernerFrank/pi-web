@@ -61,6 +61,7 @@ const S = {
 	sessions: new Map(),
 	byFile: new Map(),
 	usage: null,
+	activity: null, // tokens/messages/active-days across all chats
 	agy: null, // Antigravity app status + model quota
 	agyStarted: false,
 	procs: new Map(),
@@ -1725,7 +1726,55 @@ async function newChat(initialDir, startKind = isAgy(S.meta) ? "antigravity" : "
 
 // ── home ────────────────────────────────────────────────────────────────────
 
+/** The home page's "your activity" card: tokens (all time / 30d / 7d),
+ *  messages sent, active days — everything computed from your chats. */
+function activityCard() {
+	const a = S.activity;
+	const stat = (num, label, title) =>
+		h(
+			"div",
+			{ class: "stat", title: title || "" },
+			h("div", { class: "stat-num" }, num),
+			h("div", { class: "stat-label" }, label),
+		);
+	if (!a) return h("div", { class: "home-usage" }, h("div", { class: "home-usage-title" }, "Your activity"), h("span", { class: "meter-note" }, "Counting your chats…"));
+	const since = a.firstChat ? new Date(a.firstChat).toLocaleDateString(undefined, { month: "short", day: "numeric" }) : "";
+	const inOut = a.allTime.output != null ? `${fmtTokens(a.allTime.output)} out · ${fmtTokens(a.allTime.cache)} cache` : "";
+	return h(
+		"div",
+		{ class: "home-usage activity" },
+		h("div", { class: "home-usage-title" }, "Your activity"),
+		h(
+			"div",
+			{ class: "activity-hero" },
+			h("div", { class: "stat-num hero", title: inOut }, fmtTokens(a.allTime.tokens)),
+			h("div", { class: "stat-label" }, "tokens, all time"),
+		),
+		h(
+			"div",
+			{ class: "activity-grid" },
+			stat(fmtTokens(a.last30.tokens), "tokens · 30 days"),
+			stat(fmtTokens(a.last7.tokens), "tokens · 7 days"),
+			stat(String(a.allTime.messages), "messages sent"),
+			stat(String(a.activeDays), "active days"),
+		),
+		h(
+			"div",
+			{ class: "activity-foot" },
+			[
+				since ? `since ${since}` : null,
+				a.sessions ? `${a.sessions} chats` : null,
+				a.subagents ? `${a.subagents} subagent runs` : null,
+				a.agyMessages ? `${a.agyMessages} Antigravity messages` : null,
+			]
+				.filter(Boolean)
+				.join(" · "),
+		),
+	);
+}
+
 function renderHome() {
+	refreshActivity();
 	const root = $("#conversation");
 	const recent = [...S.sessions.values()].filter((s) => !s.parentId).sort((a, b) => activity(b) - activity(a)).slice(0, 8);
 	const warn = S.server && S.server.piBin === null
@@ -1740,6 +1789,7 @@ function renderHome() {
 			h("p", { class: "home-lead" }, "Pick a session on the left to read it (it updates live while pi works in your terminal), or start a new chat right here."),
 			warn,
 			h("div", { class: "home-actions" }, h("button", { class: "btn primary", type: "button", onclick: () => newChat() }, h("span", { html: icon("plus") }), "New chat")),
+			activityCard(),
 			S.usage
 				? h(
 						"div",
@@ -1869,6 +1919,20 @@ async function refreshAgy({ force = false } = {}) {
 	}
 	if (!S.current) renderHome();
 	agyTimer = setTimeout(refreshAgy, 60_000);
+}
+
+/** Your activity (tokens, messages, active days) across every chat, from the
+ *  server's scan of all session files. Fetched when the home page renders;
+ *  cached a minute so browsing around doesn't rescan. */
+async function refreshActivity(force = false) {
+	if (!force && S.activity && Date.now() - (S.activity.fetchedAtMs || 0) < 60_000) return;
+	try {
+		const a = await getJson("/api/activity");
+		S.activity = { ...a, fetchedAtMs: Date.now() };
+		if (!S.current) renderHome();
+	} catch {
+		// shown as unavailable until it can be computed
+	}
 }
 
 async function launchAntigravity() {

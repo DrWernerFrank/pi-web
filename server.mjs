@@ -274,6 +274,129 @@ async function searchSessions(q) {
 
 const isAgy = (id) => typeof id === "string" && id.startsWith(AGY_PREFIX);
 
+// ── your activity: tokens, messages, active days across all chats ──────────
+// Computed from the session files themselves (so it covers every chat ever,
+// not just live ones), cached by a fingerprint of their mtimes.
+
+let activityCache = { fingerprint: "", at: 0, value: null };
+
+function activityFingerprint() {
+	let sum = 0;
+	let n = 0;
+	for (const meta of index.list()) {
+		try {
+			const s = fs.statSync(meta.file);
+			sum += s.mtimeMs;
+			n++;
+		} catch {
+			// unreadable: skip
+		}
+	}
+	return `${n}:${Math.round(sum)}`;
+}
+
+function localDayKey(ts) {
+	const d = new Date(ts);
+	return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+
+const emptyBucket = () => ({ tokens: 0, messages: 0 });
+
+function computeActivity() {
+	const now = Date.now();
+	const w7 = now - 7 * 86400_000;
+	const w30 = now - 30 * 86400_000;
+	const allTime = { tokens: 0, output: 0, cache: 0, messages: 0, sessions: 0 };
+	const last7 = emptyBucket();
+	const last30 = emptyBucket();
+	const days = new Map(); // local day -> messages that day
+	let firstChat = null;
+	let subagents = 0;
+	let firstSeenOf = (ts) => {
+		if (firstChat == null || ts < firstChat) firstChat = ts;
+	};
+	for (const meta of index.list()) {
+		// Subagent chats are machine-launched: their "user" messages are task
+		// prompts, not things you typed. Count them as runs, not messages.
+		const isSub = !!meta.parentId;
+		if (isSub) subagents++;
+		else allTime.sessions++;
+		let lines;
+		try {
+			lines = fs.readFileSync(meta.file, "utf8");
+		} catch {
+			continue;
+		}
+		for (const line of lines.split("\n")) {
+			if (!line) continue;
+			let d;
+			try {
+				d = JSON.parse(line);
+			} catch {
+				continue;
+			}
+			if (d?.type !== "message") continue;
+			const m = d.message;
+			if (!m || typeof m !== "object") continue;
+			const ts = typeof m.timestamp === "number" ? m.timestamp : Date.parse(m.timestamp || "") || 0;
+			if (m.role === "user" && !isSub) {
+				allTime.messages++;
+				if (ts) {
+					firstSeenOf(ts);
+					const key = localDayKey(ts);
+					days.set(key, (days.get(key) || 0) + 1);
+				}
+				if (ts >= w7) last7.messages++;
+				if (ts >= w30) last30.messages++;
+			} else if (m.role === "assistant") {
+				const u = m.usage;
+				if (!u) continue;
+				const tokens = Number(u.totalTokens) || (Number(u.input) || 0) + (Number(u.output) || 0) + (Number(u.cacheRead) || 0) + (Number(u.cacheWrite) || 0);
+				allTime.tokens += tokens;
+				allTime.output += Number(u.output) || 0;
+				allTime.cache += (Number(u.cacheRead) || 0) + (Number(u.cacheWrite) || 0);
+				if (ts >= w7) last7.tokens += tokens;
+				if (ts >= w30) last30.tokens += tokens;
+			}
+		}
+	}
+	// Antigravity conversations you wrote to (its subagents excluded the same way).
+	let agyMessages = 0;
+	if (agy) {
+		for (const meta of agy.list()) {
+			if (meta.parentId) continue;
+			try {
+				const t = fs.readFileSync(path.join(agy.brainDir(meta.uuid), ".system_generated", "logs", "transcript.jsonl"), "utf8");
+				for (const line of t.split("\n")) {
+					if (!line.includes('"USER_EXPLICIT"')) continue;
+					agyMessages++;
+				}
+			} catch {
+				// no transcript yet
+			}
+		}
+	}
+	return {
+		allTime,
+		last7,
+		last30,
+		activeDays: days.size,
+		firstChat: firstChat ? new Date(firstChat).toISOString() : null,
+		sessions: allTime.sessions,
+		subagents,
+		agyMessages,
+	};
+}
+
+function activity() {
+	const fp = activityFingerprint();
+	const fresh = Date.now() - activityCache.at < 10 * 60_000;
+	if (activityCache.value && activityCache.fingerprint === fp && fresh) return activityCache.value;
+	const value = { ...computeActivity(), computedAt: new Date().toISOString() };
+	activityCache = { fingerprint: fp, at: Date.now(), value };
+	return value;
+}
+
 // ── Antigravity projects: working the same folder pi works ────────────────────
 // An Antigravity conversation runs inside a project's workspace folder, and a
 // project is just a JSON file in ~/.gemini/config/projects/<id>.json. Find the
@@ -1198,6 +1321,8 @@ function handleApiGet(req, res, url) {
 				.then((results) => sendJson(res, 200, { q, results }))
 				.catch((err) => sendJson(res, 200, { q, results: [], error: String(err.message || err) }));
 		}
+		case "/api/activity":
+			return sendJson(res, 200, activity());
 		case "/api/agy/status": {
 			if (!agyLive) return sendJson(res, 200, { installed: false });
 			return agyLive.quota({ force: url.searchParams.get("force") === "1" }).then((q) => sendJson(res, 200, { installed: true, ...q }));
