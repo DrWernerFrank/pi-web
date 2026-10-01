@@ -161,7 +161,7 @@ After any checkout/stash, **restart** so the running server picks up the files: 
 
 ## Safety
 
-pi-web can run pi, and pi can run commands, so the server only listens on `127.0.0.1`. It rejects requests with a foreign `Host` header (blocks DNS rebinding) and requires a per-run token on every action (blocks other websites). Images from the internet inside messages are not loaded automatically: a model could leak data through an image URL. They show as links instead.
+pi-web can run pi, and pi can run commands, so the server only listens on `127.0.0.1`. It rejects requests with a foreign `Host` header (blocks DNS rebinding) and requires an action token on every request (blocks other websites). The token is generated once and kept in `~/.cache/pi-web/token` (0600) so pages keep working across pi-web restarts — pages never detach. Images from the internet inside messages are not loaded automatically: a model could leak data through an image URL. They show as links instead.
 
 ## Troubleshooting
 

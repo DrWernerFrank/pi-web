@@ -615,6 +615,7 @@ function spawnPi({ cwd, sessionFile, expectedId }) {
 	p.on("moved", (previousId) => {
 		if (procs.get(previousId) === p) procs.delete(previousId);
 		procs.set(p.sessionId, p);
+		writeWatched();
 		if (p.tailFile !== p.sessionFile) {
 			if (p.tailFile) releaseTail(p.tailFile);
 			p.tailFile = p.sessionFile;
@@ -626,6 +627,7 @@ function spawnPi({ cwd, sessionFile, expectedId }) {
 	p.on("exit", (exit) => {
 		allProcs.delete(p);
 		if (procs.get(sid()) === p) procs.delete(sid());
+		writeWatched();
 		// A new chat that never got a reply was never written by pi: drop its placeholder.
 		if (index.pending.has(sid()) && !(p.sessionFile && isFile(p.sessionFile))) {
 			index.pending.delete(sid());
@@ -659,6 +661,59 @@ async function startFailed(p, err) {
 	return new HttpError(500, `pi failed to start: ${err.message}${tail ? `\n\n${tail}` : ""}`);
 }
 
+// ── watched sessions: what survives a restart ─────────────────────────────
+// Users keep pages open on their chats; a pi-web restart used to detach them
+// all (procs live in memory only). Instead, remember every session a proc was
+// attached to — and after a restart, quietly start fresh pis for the ones a
+// page still has open, so “pi ready” comes back on its own.
+
+const WATCHED_FILE = path.join(os.homedir(), ".cache", "pi-web", "watched.json");
+
+function readWatched() {
+	try {
+		const j = JSON.parse(fs.readFileSync(WATCHED_FILE, "utf8"));
+		return Array.isArray(j) ? new Map(j.map((s) => [s.id, s])) : new Map();
+	} catch {
+		return new Map();
+	}
+}
+function writeWatched() {
+	const list = [...procs.values()].filter((p) => !p.adopted && p.sessionId && p.cwd).map((p) => ({ id: p.sessionId, cwd: p.cwd }));
+	watched = new Map(list.map((s) => [s.id, s]));
+	try {
+		fs.mkdirSync(path.dirname(WATCHED_FILE), { recursive: true });
+		fs.writeFileSync(WATCHED_FILE, JSON.stringify(list, null, 2));
+	} catch {
+		// best effort: the in-memory map is the source of truth while running
+	}
+}
+
+/** After a restart: bring the sessions pi-web was driving back to life, so
+ *  pages that reconnect see "pi ready (web)" again instead of detaching (and
+ *  instead of the "live in terminal" mislabel for our own dead pi's writes).
+ *  The most recent chats first; idle pis stop themselves after 20 minutes,
+ *  so over-restoring costs nothing. */
+async function restoreWatched() {
+	if (!config.piBin) return;
+	const entries = [...watched.values()]
+		.filter((s) => s.id && !isAgy(s.id))
+		.map((s) => ({ ...s, mtime: index.get(s.id)?.mtime || 0 }))
+		.sort((a, b) => b.mtime - a.mtime)
+		.slice(0, 3);
+	for (const s of entries) {
+		try {
+			await ensureProc(s.id);
+			console.log(`[pi-web] restored pi for ${s.id}`);
+		} catch (err) {
+			// unreadable/gone: the page shows the honest state for it
+			console.warn(`[pi-web] restore skipped for ${s.id}: ${err.message}`);
+			watched.delete(s.id);
+			writeWatched();
+		}
+	}
+}
+let watched = readWatched();
+
 async function ensureProc(sessionId) {
 	let p = procs.get(sessionId);
 	if (p?.adopted) {
@@ -690,6 +745,7 @@ async function ensureProc(sessionId) {
 	p.tailFile = p.sessionFile;
 	if (p.tailFile) acquireTail(p.tailFile);
 	learnModels(p);
+	writeWatched();
 	return p;
 }
 
@@ -707,6 +763,7 @@ async function newSession(cwd) {
 	p.tailFile = p.sessionFile;
 	if (p.tailFile) acquireTail(p.tailFile);
 	learnModels(p);
+	writeWatched();
 	return p.sessionId;
 }
 
@@ -1448,6 +1505,7 @@ process.on("SIGHUP", shutdown);
 
 await index.scan();
 index.watch();
+void restoreWatched(); // bring back the chats pi-web was driving (pages reconnect to them)
 if (agy) {
 	agy.on("upsert", (meta) => { meta.archived = archived.has(meta.id); broadcastAll("session_upsert", meta); });
 	agy.on("remove", (id) => broadcastAll("session_remove", { id }));
