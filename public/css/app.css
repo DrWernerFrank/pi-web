@@ -3365,6 +3365,28 @@ body.no-session .composer-wrap {
 	font-size: var(--fs-xs);
 	color: var(--faint);
 }
+.meter-chat-tokens {
+	display: inline-flex;
+	align-items: center;
+	gap: 4px;
+	font-size: var(--fs-xs);
+	color: var(--muted);
+	white-space: nowrap;
+	padding: 2px 8px;
+	border-radius: var(--r-sm);
+	background: color-mix(in srgb, var(--accent) 7%, transparent);
+	border: 1px solid color-mix(in srgb, var(--accent) 18%, transparent);
+}
+.meter-chat-tokens .icon {
+	width: 12px;
+	height: 12px;
+	color: var(--accent-text);
+}
+.meter-chat-tokens b {
+	font-weight: 650;
+	color: var(--accent-text);
+	font-variant-numeric: tabular-nums;
+}
 
 .home-usage {
 	display: flex;

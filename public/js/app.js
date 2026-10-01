@@ -723,11 +723,12 @@ function sessionRow(s, children, inPinBlock = false) {
 	const when = fmtRelative(activity(s));
 	const sub = [
 		isAgy(s) ? (s.stepCount ? `${s.stepCount} steps` : null) : s.userCount ? `${s.userCount} msg` : null,
+		!isAgy(s) && s.tokens ? `${fmtTokens(s.tokens)} tok` : null,
 		isAgy(s) ? null : shortModel(s.lastModel),
 	]
 		.filter(Boolean)
 		.join(" · ");
-	const title = sessionTitle(s);
+	const title = sessionTitle(s) + (s.tokens ? ` — ${fmtTokens(s.tokens)} tokens` : "");
 	const runningSubs = runningSubagents(s).length;
 	const kids = runningSubs
 		? h("span", { class: "row-kids running" }, ` · ${runningSubs} subagent${runningSubs > 1 ? "s" : ""} running`)
@@ -1965,6 +1966,20 @@ function renderStatus() {
 				? "Context size is unknown until pi's next reply (just compacted)."
 				: `Context window: ${ctx.tokens.toLocaleString()} of ${ctx.window ? ctx.window.toLocaleString() : "?"} tokens used`;
 		parts.push(meter("Context", ctx.percent, detail, title, "ctx"));
+	}
+	// This chat's own total — scanned for offline chats, exact while pi runs.
+	const chatTokens = S.proc?.stats?.tokens?.total ?? S.meta?.tokens;
+	if (chatTokens) {
+		const msgs = S.proc?.stats?.userMessages ?? S.meta?.tokenMessages;
+		parts.push(
+			h(
+				"span",
+				{ class: "meter-chat-tokens", title: `Everything this chat has used: ${Number(chatTokens).toLocaleString()} tokens${msgs ? ` across ${msgs} of your messages` : ""} (input + output + cache — subscriptions are not billed per token)` },
+				h("span", { html: icon("zap") }),
+				h("b", {}, fmtTokens(chatTokens)),
+				" this chat",
+			),
+		);
 	}
 	if (S.usage && !S.usage.available) parts.push(h("span", { class: "meter-note", title: S.usage.reason || "" }, "Claude usage unavailable"));
 	for (const w of S.usage?.available ? S.usage.windows : []) {

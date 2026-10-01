@@ -397,6 +397,50 @@ function activity() {
 	return value;
 }
 
+// ── per-chat token counts (the sidebar's live usage read-out) ─────────────
+// Fast enough to answer on every sidebar paint: one pass over each file's
+// bytes (no JSON parse of assistant text) summing usage totals from the
+// parsed lines. Cached by file mtime+size so re-renders are free.
+
+const tokenCache = new Map(); // file -> { mtimeMs, size, tokens, messages }
+
+function sessionTokens(file) {
+	let stat;
+	try {
+		stat = fs.statSync(file);
+	} catch {
+		return { tokens: 0, messages: 0 };
+	}
+	const hit = tokenCache.get(file);
+	if (hit && hit.mtimeMs === stat.mtimeMs && hit.size === stat.size) return hit;
+	let tokens = 0;
+	let messages = 0;
+	try {
+		for (const line of fs.readFileSync(file, "utf8").split("\n")) {
+			if (!line) continue;
+			let d;
+			try {
+				d = JSON.parse(line);
+			} catch {
+				continue;
+			}
+			if (d?.type !== "message") continue;
+			const m = d.message;
+			if (!m) continue;
+			if (m.role === "user") messages++;
+			else if (m.role === "assistant" && m.usage) {
+				tokens += Number(m.usage.totalTokens) || (Number(m.usage.input) || 0) + (Number(m.usage.output) || 0) + (Number(m.usage.cacheRead) || 0) + (Number(m.usage.cacheWrite) || 0);
+			}
+		}
+	} catch {
+		// unreadable: report zeros
+	}
+	const value = { mtimeMs: stat.mtimeMs, size: stat.size, tokens, messages };
+	tokenCache.set(file, value);
+	if (tokenCache.size > 500) tokenCache.delete(tokenCache.keys().next().value);
+	return value;
+}
+
 // ── Antigravity projects: working the same folder pi works ────────────────────
 // An Antigravity conversation runs inside a project's workspace folder, and a
 // project is just a JSON file in ~/.gemini/config/projects/<id>.json. Find the
@@ -452,12 +496,26 @@ function metaFor(id) {
 function decorated(meta) {
 	const m = meta.kind === "antigravity" ? meta : index.decorate(meta);
 	m.archived = archived.has(m.id);
+	// Live usage for the sidebar: this chat's tokens (cached; the scan is one
+	// pass, re-run only when the file changed).
+	if (m.kind !== "antigravity" && m.file) {
+		const t = sessionTokens(m.file);
+		m.tokens = t.tokens;
+		m.tokenMessages = t.messages;
+	}
 	return m;
 }
 
 function allSessions() {
 	const out = agy ? [...index.list(), ...agy.list()] : index.list();
-	for (const s of out) s.archived = archived.has(s.id);
+	for (const s of out) {
+		s.archived = archived.has(s.id);
+		if (s.kind !== "antigravity" && s.file && s.tokens == null) {
+			const t = sessionTokens(s.file);
+			s.tokens = t.tokens;
+			s.tokenMessages = t.messages;
+		}
+	}
 	return out;
 }
 const tails = new Map(); // file -> { tail, refs, timer, watcher }
@@ -1366,7 +1424,7 @@ function handleApiGet(req, res, url) {
 		case "/api/health":
 			return sendJson(res, 200, { ok: true, version: VERSION, commit, piVersion, piBin: config.piBin || null });
 		case "/api/sessions":
-			return sendJson(res, 200, { sessions: index.list(), projects: index.projects() });
+			return sendJson(res, 200, { sessions: allSessions(), projects: index.projects() });
 		case "/api/projects":
 			return sendJson(res, 200, { projects: index.projects(), home: os.homedir() });
 		case "/api/usage":
