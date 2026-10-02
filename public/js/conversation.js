@@ -561,6 +561,7 @@ export class Conversation {
 		const bits = [];
 		if (m.model) bits.push(m.model);
 		if (usage.output) bits.push(`${fmtTokens(usage.output)} out`);
+		if (usage.reasoning) bits.push(`${fmtTokens(usage.reasoning)} think`);
 		const tps = this.tpsBy.get(messageKey(m));
 		if (tps) bits.push(`${tps} tok/s`);
 		const cost = fmtCost(usage.cost?.total);
@@ -1455,9 +1456,11 @@ export class Conversation {
 				return;
 			case "message_end":
 				if (ev.message?.role === "assistant" && this.streamT0) {
-					// Exact: real output tokens over the true streamed seconds.
+					// Exact: real generated tokens (output + reasoning — thinking
+					// counts; it's generated too and pi reports it separately) over
+					// the true streamed seconds.
 					const secs = (Date.now() - this.streamT0) / 1000;
-					const out = Number(ev.message.usage?.output) || 0;
+					const out = (Number(ev.message.usage?.output) || 0) + (Number(ev.message.usage?.reasoning) || 0);
 					if (secs > 0.4 && out > 3) this.tpsBy.set(messageKey(ev.message), Math.round(out / secs));
 					this.streamT0 = 0;
 					this.streamChars = 0;
@@ -1622,7 +1625,8 @@ export class Conversation {
 		if (live.partial && this.streamT0) {
 			// Current text length of the partial (seed 0 — this is a measurement,
 			// not an accumulator: summing into the previous total would compound).
-			const chars = (live.partial.content || []).filter((b) => b?.type === "text").reduce((n, b) => n + (b.text?.length || 0), 0);
+			// Thinking streams too: its text counts toward the estimate.
+			const chars = (live.partial.content || []).reduce((n, b) => n + ((b?.type === "text" ? b.text?.length : b?.type === "thinking" ? b.thinking?.length : 0) || 0), 0);
 			if (chars > this.streamChars) this.streamChars = chars;
 			const secs = (Date.now() - this.streamT0) / 1000;
 			const est = Math.round(this.streamChars / 4 / Math.max(secs, 0.4));

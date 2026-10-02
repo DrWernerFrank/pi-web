@@ -351,7 +351,8 @@ function computeActivity() {
 			} else if (m.role === "assistant") {
 				const u = m.usage;
 				if (!u) continue;
-				const tokens = Number(u.totalTokens) || (Number(u.input) || 0) + (Number(u.output) || 0) + (Number(u.cacheRead) || 0) + (Number(u.cacheWrite) || 0);
+				// Reasoning is outside totalTokens (pi reports it separately): count it.
+				const tokens = (Number(u.totalTokens) || (Number(u.input) || 0) + (Number(u.output) || 0) + (Number(u.cacheRead) || 0) + (Number(u.cacheWrite) || 0)) + (Number(u.reasoning) || 0);
 				allTime.tokens += tokens;
 				allTime.output += Number(u.output) || 0;
 				allTime.cache += (Number(u.cacheRead) || 0) + (Number(u.cacheWrite) || 0);
@@ -414,6 +415,7 @@ function sessionTokens(file) {
 	const hit = tokenCache.get(file);
 	if (hit && hit.mtimeMs === stat.mtimeMs && hit.size === stat.size) return hit;
 	let tokens = 0;
+	let reasoning = 0;
 	let messages = 0;
 	try {
 		for (const line of fs.readFileSync(file, "utf8").split("\n")) {
@@ -429,13 +431,18 @@ function sessionTokens(file) {
 			if (!m) continue;
 			if (m.role === "user") messages++;
 			else if (m.role === "assistant" && m.usage) {
-				tokens += Number(m.usage.totalTokens) || (Number(m.usage.input) || 0) + (Number(m.usage.output) || 0) + (Number(m.usage.cacheRead) || 0) + (Number(m.usage.cacheWrite) || 0);
+				const u = m.usage;
+				// pi's totalTokens is input+output+cacheRead+cacheWrite — reasoning
+				// (thinking) is reported separately and never inside it. A chat's
+				// real usage includes its reasoning, so count it too.
+				tokens += Number(u.totalTokens) || (Number(u.input) || 0) + (Number(u.output) || 0) + (Number(u.cacheRead) || 0) + (Number(u.cacheWrite) || 0);
+				reasoning += Number(u.reasoning) || 0;
 			}
 		}
 	} catch {
 		// unreadable: report zeros
 	}
-	const value = { mtimeMs: stat.mtimeMs, size: stat.size, tokens, messages };
+	const value = { mtimeMs: stat.mtimeMs, size: stat.size, tokens: tokens + reasoning, reasoning, messages };
 	tokenCache.set(file, value);
 	if (tokenCache.size > 500) tokenCache.delete(tokenCache.keys().next().value);
 	return value;
@@ -493,6 +500,22 @@ function metaFor(id) {
 	return index.get(id);
 }
 
+/** pi's own stats total misses reasoning (verified: totalTokens is always
+ *  input+output+cacheRead+cacheWrite, and get_session_stats exposes no
+ *  reasoning at all). Fold the session file's reasoning sum into the stats so
+ *  every live read-out — chip, topbar, snapshot — counts what was really
+ *  generated, matching the sidebar's scanned numbers. */
+function procInfo(p) {
+	const info = p.info();
+	if (info?.stats && p.sessionFile) {
+		const t = sessionTokens(p.sessionFile);
+		if (t.reasoning) {
+			info.stats = { ...info.stats, reasoning: t.reasoning, tokens: { ...(info.stats.tokens || {}), total: (info.stats.tokens?.total || 0) + t.reasoning } };
+		}
+	}
+	return info;
+}
+
 function decorated(meta) {
 	const m = meta.kind === "antigravity" ? meta : index.decorate(meta);
 	m.archived = archived.has(m.id);
@@ -501,6 +524,7 @@ function decorated(meta) {
 	if (m.kind !== "antigravity" && m.file) {
 		const t = sessionTokens(m.file);
 		m.tokens = t.tokens;
+		m.reasoning = t.reasoning;
 		m.tokenMessages = t.messages;
 	}
 	return m;
@@ -513,6 +537,7 @@ function allSessions() {
 		if (s.kind !== "antigravity" && s.file && s.tokens == null) {
 			const t = sessionTokens(s.file);
 			s.tokens = t.tokens;
+			s.reasoning = t.reasoning;
 			s.tokenMessages = t.messages;
 		}
 	}
@@ -621,7 +646,7 @@ function snapshot(sessionId) {
 		header: t?.header ?? null,
 		entries,
 		links: linksFor(entries),
-		proc: proc ? proc.info() : null,
+		proc: proc ? procInfo(proc) : null,
 		live: proc && proc.state !== "exited" ? proc.live : null,
 	};
 }
@@ -666,7 +691,7 @@ function spawnPi({ cwd, sessionFile, expectedId }) {
 		}
 	});
 	p.on("state", () => {
-		broadcastSession(sid(), "proc", p.info());
+		broadcastSession(sid(), "proc", procInfo(p));
 		broadcastAll("proc_summary", procSummary(p));
 	});
 	p.on("notice", (notice) => broadcastSession(sid(), "notice", notice));
@@ -695,7 +720,7 @@ function spawnPi({ cwd, sessionFile, expectedId }) {
 			releaseTail(p.tailFile);
 			p.tailFile = null;
 		}
-		broadcastSession(sid(), "proc", p.info());
+		broadcastSession(sid(), "proc", procInfo(p));
 		broadcastAll("proc_summary", procSummary(p));
 		if (!p.stopRequested) {
 			broadcastSession(sid(), "notice", {
@@ -793,7 +818,7 @@ async function ensureProc(sessionId) {
 	if (!isDir(meta.cwd)) throw new HttpError(400, `The session's folder no longer exists: ${meta.cwd}`);
 	p = spawnPi({ cwd: meta.cwd, sessionFile: meta.file, expectedId: sessionId });
 	procs.set(sessionId, p);
-	broadcastSession(sessionId, "proc", p.info());
+	broadcastSession(sessionId, "proc", procInfo(p));
 	try {
 		await p.ready;
 	} catch (err) {
@@ -902,7 +927,7 @@ bridge.on("connect", (key, pid) => {
 	if (!p && typeof pid === "number") p = adoptOrphan(key, pid);
 	if (!p) return;
 	p.bridgeConnected = true;
-	broadcastSession(p.sessionId, "proc", p.info());
+	broadcastSession(p.sessionId, "proc", procInfo(p));
 });
 bridge.on("message", (key, msg) => {
 	const p = procByKey(key);
