@@ -1442,6 +1442,9 @@ export class Conversation {
 		switch (ev.type) {
 			case "message_update":
 				this.updatePartial();
+				// rAF can stall in background/headless windows; the tok/s read-out
+				// must not depend on frame scheduling. Cheap enough to run directly.
+				this.renderStatus();
 				return;
 			case "message_start":
 				if (ev.message?.role === "assistant") {
@@ -1617,7 +1620,9 @@ export class Conversation {
 		}
 		// Live speed while the reply streams: characters ≈ 4 per token.
 		if (live.partial && this.streamT0) {
-			const chars = (live.partial.content || []).filter((b) => b?.type === "text").reduce((n, b) => n + (b.text?.length || 0), this.streamChars);
+			// Current text length of the partial (seed 0 — this is a measurement,
+			// not an accumulator: summing into the previous total would compound).
+			const chars = (live.partial.content || []).filter((b) => b?.type === "text").reduce((n, b) => n + (b.text?.length || 0), 0);
 			if (chars > this.streamChars) this.streamChars = chars;
 			const secs = (Date.now() - this.streamT0) / 1000;
 			const est = Math.round(this.streamChars / 4 / Math.max(secs, 0.4));
