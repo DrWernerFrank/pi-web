@@ -1408,6 +1408,17 @@ select:focus-visible {
 .live-row.warn {
 	color: var(--warn);
 }
+.live-row.tps-row {
+	justify-content: flex-end;
+	gap: 6px;
+	color: var(--accent-text);
+	font-size: var(--fs-xs);
+	margin: 2px 0 0;
+}
+.live-row.tps-row .icon {
+	width: 12px;
+	height: 12px;
+}
 .item.streaming .md > :last-child::after {
 	content: "";
 	display: inline-block;

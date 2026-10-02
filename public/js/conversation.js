@@ -170,7 +170,12 @@ export class Conversation {
 		this.drafts = new Map(); // toolCallId -> answer being prepared / just sent
 		this.inlineDialogs = new Map(); // toolCallId -> editor dialog shown inside a question card
 		this.stick = true;
-		this.updatePartial = rafThrottle(() => this.renderPartial());
+		this.updatePartial = rafThrottle(() => {
+			this.renderPartial();
+			// The status area includes the live tok/s read-out, which is exactly
+			// what changes as deltas arrive — repaint it with the partial.
+			this.renderStatus();
+		});
 		this.toolTimers = new Map();
 		scroller.addEventListener(
 			"scroll",
@@ -209,6 +214,12 @@ export class Conversation {
 		this.liveNodes = new Map();
 		this.toolNodes = new Map();
 		this.partial = null;
+		// Streaming speed: live estimate while a reply streams (deltas carry no
+		// token counts, so estimate from characters ≈ 4 per token), and the exact
+		// average stamped per message once it settles.
+		this.streamT0 = 0;
+		this.streamChars = 0;
+		this.tpsBy = new Map();
 		this.root.replaceChildren();
 		this.moreEl = h("div", { class: "load-earlier" });
 		this.itemsEl = h("div", { class: "items" });
@@ -550,6 +561,8 @@ export class Conversation {
 		const bits = [];
 		if (m.model) bits.push(m.model);
 		if (usage.output) bits.push(`${fmtTokens(usage.output)} out`);
+		const tps = this.tpsBy.get(messageKey(m));
+		if (tps) bits.push(`${tps} tok/s`);
 		const cost = fmtCost(usage.cost?.total);
 		if (cost) bits.push(cost);
 		const time = fmtClock(m.timestamp);
@@ -1431,9 +1444,21 @@ export class Conversation {
 				this.updatePartial();
 				return;
 			case "message_start":
-				if (ev.message?.role === "assistant") this.renderPartial();
+				if (ev.message?.role === "assistant") {
+					this.streamT0 = Date.now();
+					this.streamChars = 0;
+					this.renderPartial();
+				}
 				return;
 			case "message_end":
+				if (ev.message?.role === "assistant" && this.streamT0) {
+					// Exact: real output tokens over the true streamed seconds.
+					const secs = (Date.now() - this.streamT0) / 1000;
+					const out = Number(ev.message.usage?.output) || 0;
+					if (secs > 0.4 && out > 3) this.tpsBy.set(messageKey(ev.message), Math.round(out / secs));
+					this.streamT0 = 0;
+					this.streamChars = 0;
+				}
 				this.partial = null;
 				this.pruneFinals();
 				if (ev.message?.role === "toolResult") this.refreshTool(ev.message.toolCallId);
@@ -1589,6 +1614,14 @@ export class Conversation {
 			parts.push(h("div", { class: "live-row" }, h("span", { class: "spinner" }), "Compacting the context…"));
 		} else if (live.busy && !live.partial && !Object.values(live.tools).some((t) => !t.done)) {
 			parts.push(h("div", { class: "live-row" }, h("span", { class: "dots" }, h("i"), h("i"), h("i")), "Working"));
+		}
+		// Live speed while the reply streams: characters ≈ 4 per token.
+		if (live.partial && this.streamT0) {
+			const chars = (live.partial.content || []).filter((b) => b?.type === "text").reduce((n, b) => n + (b.text?.length || 0), this.streamChars);
+			if (chars > this.streamChars) this.streamChars = chars;
+			const secs = (Date.now() - this.streamT0) / 1000;
+			const est = Math.round(this.streamChars / 4 / Math.max(secs, 0.4));
+			if (est > 2) parts.push(h("div", { class: "live-row tps-row" }, h("span", { html: icon("zap") }), `streaming ~${est} tok/s`));
 		}
 		if (live.error) parts.push(h("div", { class: "msg-error" }, h("span", { html: icon("alert") }), h("span", {}, live.error)));
 		// While a reply streams, its Copy button only exists once it settles —
