@@ -91,8 +91,12 @@ start_server() {
 	if has_tmux; then
 		tmux kill-session -t "$TMUX_SESSION" 2>/dev/null
 		# Running inside tmux lets pi's subagents open their panes from the GUI too.
+		# The server runs in a restart loop: if it ever dies on its own (a bug, an
+		# OOM kill), it comes back within seconds — pages reconnect by themselves
+		# (the action token persists and watched pis are restored at boot).
+		# "pi-web stop" kills this whole session, loop and all.
 		tmux new-session -d -s "$TMUX_SESSION" -c "$HERE" \
-			"'$NODE' '$HERE/server.mjs' --port '$PORT'; echo; echo 'pi-web has stopped. Press Enter to close.'; read -r _"
+			"while :; do '$NODE' '$HERE/server.mjs' --port '$PORT'; c=\$?; echo; echo \"pi-web exited (code \$c). Restarting in 2s... stop with: pi-web stop\"; sleep 2; done"
 	else
 		mkdir -p "$HOME/.cache/pi-web"
 		nohup "$NODE" "$HERE/server.mjs" --port "$PORT" >"$HOME/.cache/pi-web/server.log" 2>&1 &

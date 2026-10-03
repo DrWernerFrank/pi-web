@@ -555,8 +555,37 @@ let clientSeq = 0;
 // ── server-sent events ──────────────────────────────────────────────────────
 
 function sse(client, event, data) {
-	if (client.res.writableEnded) return;
-	client.res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+	if (client.res.writableEnded || client.res.destroyed) return;
+	try {
+		client.res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+	} catch (err) {
+		// A client that died between our check and the write. The 'close'/
+		// 'error' handlers drop it from `clients`; this must not throw or the
+		// process dies (an SSE write to a dying socket is the classic killer).
+		if (client.res.destroyed) clients.delete(client);
+		else sseDead(client, err);
+	}
+}
+
+/** The client a response belongs to (or null — the error may fire before
+ *  registration finishes, which is fine). */
+function clientOf(res) {
+	for (const c of clients) if (c.res === res) return c;
+	return null;
+}
+
+/** Retire a client whose connection is gone: without this, its pending ping
+ *  writes were unhandled stream errors — enough to take pi-web down. */
+function sseDead(client, err) {
+	if (!client || !clients.has(client)) return;
+	clients.delete(client);
+	if (client.file) {
+		try {
+			releaseTail(client.file);
+		} catch {
+			// already released
+		}
+	}
 }
 function broadcastAll(event, data) {
 	for (const c of clients) sse(c, event, data);
@@ -970,15 +999,19 @@ bridge.on("message", (key, msg) => {
 
 // Stop pi processes nobody has looked at for a while (like closing a terminal).
 setInterval(() => {
-	const now = Date.now();
-	for (const [id, p] of procs) {
-		if (p.state !== "ready" || p.live.busy) continue;
-		const watched = [...clients].some((c) => c.sessionId === id);
-		const waiting = Object.keys(p.live.dialogs).length + Object.keys(p.live.bridge).length > 0;
-		if (!watched && !waiting && now - p.lastActivity > IDLE_STOP_MS) {
-			p.stopRequested = true;
-			p.stop();
+	try {
+		const now = Date.now();
+		for (const [id, p] of procs) {
+			if (p.state !== "ready" || p.live.busy) continue;
+			const watched = [...clients].some((c) => c.sessionId === id);
+			const waiting = Object.keys(p.live.dialogs).length + Object.keys(p.live.bridge).length > 0;
+			if (!watched && !waiting && now - p.lastActivity > IDLE_STOP_MS) {
+				p.stopRequested = true;
+				p.stop();
+			}
 		}
+	} catch (err) {
+		logCrash("idle-stopper error (recovered)", err);
 	}
 }, 60_000).unref();
 
@@ -1152,6 +1185,9 @@ function handleStream(req, res, url) {
 		"X-Accel-Buffering": "no",
 	});
 	res.write("retry: 2000\n\n");
+	// A page that vanishes mid-write (reload, sleep, network drop) errors the
+	// response: handle it like a close, never as an unhandled stream error.
+	res.on("error", () => sseDead(clientOf(res), null));
 	const client = { id: ++clientSeq, res, sessionId, file: null };
 	const meta = sessionId ? metaFor(sessionId) : undefined;
 	if (meta?.file) {
@@ -1572,6 +1608,38 @@ const server = http.createServer((req, res) => {
 
 index.on("upsert", (meta) => { meta.archived = archived.has(meta.id); broadcastAll("session_upsert", meta); });
 index.on("remove", (id) => broadcastAll("session_remove", { id }));
+
+// ── why-did-it-die log ──────────────────────────────────────────────────────
+// Every unexpected exit (uncaught exception, unhandled rejection) is written
+// with its stack to ~/.cache/pi-web/crash.log before the process goes down, so
+// "pi-web died" is always answerable afterwards. The tmux wrapper restarts the
+// server within seconds (persistent token + watched-proc restore bring the
+// pages back on their own).
+const CRASH_LOG = path.join(os.homedir(), ".cache", "pi-web", "crash.log");
+function logCrash(kind, err) {
+	const lines = [
+		`\n=== ${new Date().toISOString()} ${kind} ===`,
+		`rss: ${Math.round(process.memoryUsage().rss / 1048576)} MB, uptime: ${Math.round(process.uptime())}s`,
+		err?.stack || String(err),
+	];
+	try {
+		fs.mkdirSync(path.dirname(CRASH_LOG), { recursive: true });
+		fs.appendFileSync(CRASH_LOG, lines.join("\n") + "\n");
+	} catch {
+		// even the log is unwritable: nothing more to do
+	}
+	console.error(`[pi-web] ${kind}: ${err?.message || err}\n${err?.stack || ""}`);
+}
+
+process.on("uncaughtException", (err) => {
+	logCrash("uncaught exception", err);
+	// State may be corrupted; exit and let the wrapper restart us cleanly.
+	process.exit(1);
+});
+process.on("unhandledRejection", (err) => {
+	logCrash("unhandled rejection", err);
+	// A rejection alone doesn't corrupt anything: keep serving, it's logged.
+});
 
 function shutdown() {
 	for (const p of allProcs) {
