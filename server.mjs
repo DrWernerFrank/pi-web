@@ -997,6 +997,42 @@ bridge.on("message", (key, msg) => {
 	}
 });
 
+// ── memory watchdog ─────────────────────────────────────────────────────────
+// This machine runs 6.6 GB WSL with real OOM kills in the log (big python /
+// numpy jobs in tmux scopes). When the kernel's global OOM killer fires it
+// takes victims by chance — pi-web included. Instead: when our RSS is large
+// AND system memory is nearly gone, exit on our own terms. The restart loop
+// brings the server back in ~2s with a fresh, smaller heap; pages reconnect
+// by themselves (persistent token + watched-proc restore). Recorded first,
+// so the crash log says "self-defensive restart", not a mystery.
+setInterval(() => {
+	try {
+		const rss = process.memoryUsage().rss;
+		// MemAvailable from /proc/meminfo (os.availableMemory is not in Node 22):
+		// the kernel's honest "how much is allocatable right now" number.
+		let sysFree = 0;
+		try {
+			const meminfo = fs.readFileSync("/proc/meminfo", "utf8");
+			sysFree = (Number(/MemAvailable:\s+(\d+) kB/.exec(meminfo)?.[1]) || 0) * 1024;
+		} catch {
+			// unreadable: skip the system check, keep the rss check
+		}
+		const sysTotal = os.totalmem();
+		const sysFreePct = sysTotal ? sysFree / sysTotal : 1;
+		// Our own bloat: > 900 MB of server state needs a reset (typical is
+		// 100-200 MB; leak growth lives above that).
+		const selfBloat = rss > 900 * 1024 * 1024;
+		// Danger zone: under 300 MB free system-wide while we hold real memory.
+		const systemPinch = sysFreePct < 0.05 && sysFree < 300 * 1024 * 1024 && rss > 150 * 1024 * 1024;
+		if (selfBloat || systemPinch) {
+			logCrash(selfBloat ? "self-defensive restart (rss > 900MB)" : "self-defensive restart (system memory pinch)", new Error(`rss=${Math.round(rss / 1048576)}MB free=${Math.round(sysFree / 1048576)}MB total=${Math.round(sysTotal / 1048576)}MB`));
+			process.exit(1);
+		}
+	} catch (err) {
+		logCrash("watchdog error (recovered)", err);
+	}
+}, 15_000).unref();
+
 // Stop pi processes nobody has looked at for a while (like closing a terminal).
 setInterval(() => {
 	try {

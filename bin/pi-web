@@ -96,7 +96,7 @@ start_server() {
 		# (the action token persists and watched pis are restored at boot).
 		# "pi-web stop" kills this whole session, loop and all.
 		tmux new-session -d -s "$TMUX_SESSION" -c "$HERE" \
-			"while :; do '$NODE' '$HERE/server.mjs' --port '$PORT'; c=\$?; echo; echo \"pi-web exited (code \$c). Restarting in 2s... stop with: pi-web stop\"; sleep 2; done"
+			"'$HERE/bin/serve-loop.sh' '$PORT'"
 	else
 		mkdir -p "$HOME/.cache/pi-web"
 		nohup "$NODE" "$HERE/server.mjs" --port "$PORT" >"$HOME/.cache/pi-web/server.log" 2>&1 &
