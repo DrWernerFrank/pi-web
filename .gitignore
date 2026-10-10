@@ -34,3 +34,6 @@ desktop.ini
 .idea/
 *.swp
 *.pid
+
+# this repo's local working copy of the paper (kept out on purpose)
+AI_in_Mathematics_Paper.md
