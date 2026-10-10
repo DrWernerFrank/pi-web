@@ -1,3 +1,36 @@
+# dependencies
 node_modules/
+
+# local runtime state & uploads (user files, never source)
 pi-web-uploads/
+.cache/
+
+# secrets — never, in any variant
 .env
+.env.*
+!.env.example
+
+# logs — several carry live server passwords (opencode-serve.log, oc-serve.log)
+*.log
+npm-debug.log*
+
+# agent state dirs created when agents run inside this project
+.pi/
+.claude/
+.opencode/
+.qoder/
+.gemini/
+.aider*
+.cursor/
+
+# session / transcript captures — chat history, private by definition
+*.jsonl
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+*.swp
+*.pid
