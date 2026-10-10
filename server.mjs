@@ -344,6 +344,9 @@ function localDayKey(ts) {
 
 const emptyBucket = () => ({ tokens: 0, messages: 0 });
 
+/** OpenCode metas carry ISO strings ("2026-10-10T…") — ms since epoch. */
+const toMsOc = (v) => (typeof v === "number" ? v : Date.parse(v || "") || 0);
+
 // Per-file cached activity stats: a live session writes every few seconds,
 // and recomputing used to re-READ every session file on the home page's every
 // refresh (O(all sessions) per message). Now each file is parsed once per
@@ -440,6 +443,25 @@ function computeActivity() {
 			if (ts >= w30) last30.tokens += agg.tokens;
 		}
 	}
+	// OpenCode sessions (top-level ones only, same rule as pi's subagents).
+	// Their token totals come from the service (input+output+reasoning+cache per
+	// session); the 7/30-day windows attribute a session's tokens to its last
+	// activity day — day-granular and honest about it.
+	let ocStats = null;
+	if (oc) {
+		ocStats = { sessions: 0, tokens: 0 };
+		for (const m of oc.list()) {
+			if (m.parentId || !m.tokens) continue;
+			ocStats.sessions++;
+			ocStats.tokens += m.tokens;
+			allTime.tokens += m.tokens;
+			const t = toMsOc(m.lastActivity) || m.mtime || 0;
+			if (t) {
+				if (t >= w7) last7.tokens += m.tokens;
+				if (t >= w30) last30.tokens += m.tokens;
+			}
+		}
+	}
 	// Antigravity conversations you wrote to (its subagents excluded the same way).
 	let agyMessages = 0;
 	if (agy) {
@@ -465,6 +487,7 @@ function computeActivity() {
 		sessions: allTime.sessions,
 		subagents,
 		agyMessages,
+		oc: ocStats,
 	};
 }
 
@@ -1168,6 +1191,7 @@ if (oc) {
 		if (n.sessionId) broadcastSession(n.sessionId, "notice", n);
 		else broadcastAll("notice", n);
 	});
+	oc.on("service", (state) => broadcastAll("oc_service", state));
 }
 
 // ── memory watchdog ─────────────────────────────────────────────────────────
@@ -1430,6 +1454,7 @@ function handleStream(req, res, url) {
 		sessionsDir: config.sessionsDir,
 		antigravity: !!agy,
 		opencode: !!oc,
+		ocService: oc ? oc.serviceState() : null,
 		sessions: allSessions(),
 		procs: [...procs.values()].map(procSummary),
 		session: sessionId ? snapshot(sessionId) : null,
@@ -1439,7 +1464,7 @@ function handleStream(req, res, url) {
 	if (isOc(sessionId) && oc) {
 		oc.entriesFor(sessionId)
 			.then((entries) => sse(client, "entries", { entries, links: {} }))
-			.catch(() => sse(client, "notice", { level: "error", message: "Could not read this OpenCode session." }));
+			.catch((err) => sse(client, "notice", { level: "error", message: err.message }));
 	}
 	const ping = setInterval(() => res.write(": ping\n\n"), 20_000);
 	req.on("close", () => {
@@ -1745,6 +1770,29 @@ async function handleApiPost(route, body) {
 			await awaitAgyConversation(AGY_PREFIX + uuid);
 			return { ok: true, session: AGY_PREFIX + uuid };
 		}
+		case "/api/oc/service": {
+			// Start/stop OpenCode's background service — the pill's on/off.
+			if (!oc) throw new HttpError(404, "OpenCode was not found on this machine.");
+			if (body.action === "stop") {
+				let r;
+				try {
+					r = await oc.stopService({ force: body.force === true });
+				} catch (err) {
+					throw new HttpError(err.status || 502, err.message);
+				}
+				if (r.refused) throw new HttpError(409, `A run is in progress (${r.running.map((s) => `“${s.title || "a session"}”`).join(", ")}) — confirm to stop anyway.`);
+				return { ok: true, ...r };
+			}
+			if (body.action === "start") {
+				try {
+					await oc.startService();
+				} catch (err) {
+					throw new HttpError(err.status || 502, err.message);
+				}
+				return { ok: true, ...oc.serviceState() };
+			}
+			throw new HttpError(400, "Unknown action");
+		}
 		case "/api/oc/model": {
 			// Set the model (and agent) for an OpenCode session.
 			if (!oc) throw new HttpError(404, "OpenCode was not found on this machine.");
@@ -1832,10 +1880,9 @@ async function handleApiGet(req, res, url) {
 		}
 		case "/api/oc/status": {
 			if (!oc) return sendJson(res, 200, { installed: false });
-			const info = { installed: true, version: oc.version, connected: !!oc.conn, running: [] };
-			for (const m of oc.list()) if (m.running) info.running.push(m.id);
-			return sendJson(res, 200, info);
+			return sendJson(res, 200, { installed: true, ...oc.serviceState() });
 		}
+
 		case "/api/oc/models": {
 			if (!oc) throw new HttpError(404, "OpenCode was not found on this machine.");
 			const models = await oc.models().catch((err) => { throw new HttpError(err.status || 502, err.message); });

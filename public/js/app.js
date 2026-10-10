@@ -64,6 +64,7 @@ const S = {
 	activity: null, // tokens/messages/active-days across all chats
 	agy: null, // Antigravity app status + model quota
 	agyStarted: false,
+	ocService: null, // OpenCode service: {stopped, connected, version, sessions, running}
 	procs: new Map(),
 	attention: new Set(),
 	current: null,
@@ -513,6 +514,13 @@ function connect(id) {
 		if (open) openOcPermission(request);
 		else closeOcPermission(request.id);
 	});
+	on("oc_service", (st) => {
+		S.ocService = st;
+		if (isOc(S.meta)) {
+			renderTopbar();
+			updateComposer();
+		}
+	});
 	on("moved", ({ to }) => navigate(to));
 }
 
@@ -548,6 +556,7 @@ function onHello(data) {
 	S.loadedCommit = data.commit || S.loadedCommit;
 	S.home = data.home || "";
 	S.server = data;
+	S.ocService = data.ocService || null;
 	S.sessions = new Map((data.sessions || []).map((s) => [s.id, s]));
 	indexSessions();
 	panel.onSessions();
@@ -892,17 +901,23 @@ function renderTopbar() {
 
 	const side = [];
 	if (isOc(meta)) {
-		side.push(
-			h(
-				"span",
-				{
-					class: `proc-pill ${meta.running ? "busy" : "running"}`,
-					title: meta.running ? "OpenCode is working on this session" : "OpenCode's background service is up; send a message to run it",
-				},
-				h("span", { class: "dot" }),
-				meta.running ? "OpenCode · working" : "OpenCode · ready",
-			),
+		// The service pill is a control, not just a label: click it for the
+		// on/off (see openOcServiceMenu).
+		const svc = S.ocService || { stopped: false };
+		const cls = meta.running ? "busy" : svc.stopped ? "idle" : "running";
+		const label = meta.running ? "OpenCode · working" : svc.stopped ? "OpenCode · stopped" : "OpenCode · ready";
+		const pill = h(
+			"button",
+			{
+				class: `proc-pill ${cls}`,
+				type: "button",
+				title: svc.stopped ? "OpenCode's service is stopped — click to start it" : "OpenCode's background service — click for controls",
+				onclick: (e) => openOcServiceMenu(e.currentTarget),
+			},
+			h("span", { class: "dot" }),
+			label,
 		);
+		side.push(pill);
 		side.push(modelButton("oc"));
 	} else if (isAgy(meta)) {
 		side.push(
@@ -1285,6 +1300,7 @@ function openMenu(anchor) {
 					: null,
 				item("Rename…", "note", renameSession),
 				item("Session info", "note", sessionInfo),
+				item(S.ocService?.stopped ? "Start the OpenCode service" : "Stop the OpenCode service…", "power", () => (S.ocService?.stopped ? startOcService() : confirmOcStop(S.ocService?.running || []))),
 				h("div", { class: "menu-note" }, `OpenCode ${S.server?.ocVersion || ""} · runs in its own background service; idle sessions cost nothing`),
 				h("div", { class: "menu-sep" }),
 			]
@@ -1970,6 +1986,101 @@ function closeOcPermission(requestId) {
 /** An OpenCode session id ("ses_…") as pi-web's routed id ("oc-ses_…"). */
 const OC_SESS = (ocId) => `oc-${ocId}`;
 
+// ── OpenCode service control (the pill's on/off) ──────────────────────────
+
+async function startOcService() {
+	const t = toast("Starting OpenCode…", "info");
+	try {
+		await post("/api/oc/service", { action: "start" });
+		t.remove();
+		toast("OpenCode is up.", "info");
+	} catch (err) {
+		t.remove();
+		toast(err.message, "error");
+	}
+}
+
+async function confirmOcStop(running = []) {
+	const names = running
+		.slice(0, 3)
+		.map((r) => `“${r.title || "a session"}”`)
+		.join(", ")
+		.concat(running.length > 3 ? ` and ${running.length - 3} more` : "");
+	const ok = await confirmModal(
+		"Stop OpenCode?",
+		`Its background service stops — the thing that runs these sessions.${running.length ? ` A run in progress is ended (OpenCode sessions don't survive a service stop the way pi tasks survive pi-web restarts). Running now: ${names}.` : " Nothing is running right now."} Your sessions stay listed here and come back when you start it again.`,
+		"Stop it",
+	);
+	if (!ok) return;
+	const t = toast("Stopping OpenCode…", "info");
+	try {
+		await post("/api/oc/service", { action: "stop", force: true });
+		t.remove();
+		toast("OpenCode stopped.", "info");
+	} catch (err) {
+		t.remove();
+		toast(err.message, "error");
+	}
+}
+
+/** The pill's popover: what the service is doing, and its on/off. */
+async function openOcServiceMenu(anchor) {
+	let st = S.ocService;
+	try {
+		st = await getJson("/api/oc/status");
+		S.ocService = st;
+	} catch {
+		// keep the last known state
+	}
+	const box = h("div", { class: "menu" });
+	if (!st?.installed) {
+		box.append(h("div", { class: "menu-note" }, "OpenCode is not installed on this machine."));
+	} else if (st.stopped) {
+		box.append(h("div", { class: "menu-note" }, `OpenCode's service is stopped${st.sessions ? ` — its ${st.sessions} sessions stay listed` : ""}.`));
+		box.append(
+			h(
+				"button",
+				{
+					class: "menu-item",
+					type: "button",
+					onclick: () => {
+						closePopover();
+						startOcService();
+					},
+				},
+				h("span", { html: icon("power") }),
+				"Start OpenCode",
+			),
+		);
+	} else {
+		const running = st.running || [];
+		box.append(
+			h(
+					"div",
+					{ class: "menu-note" },
+					`Service up${st.version ? ` (v${st.version})` : ""} · ${st.sessions ?? 0} sessions${running.length ? ` · ${running.length} running` : ""}.`,
+			),
+		);
+		box.append(
+			h(
+				"button",
+					{
+						class: "menu-item danger",
+						type: "button",
+						onclick: () => {
+							closePopover();
+							confirmOcStop(running);
+						},
+					},
+				h("span", { html: icon("power") }),
+				"Stop OpenCode…",
+			),
+		);
+		box.append(h("div", { class: "menu-note" }, "Stopping ends any run in progress; sessions come back when it starts again."));
+	}
+	openPopover(anchor, box, "menu-pop");
+}
+
 // ── new chat ────────────────────────────────────────────────────────────────
 
 async function newChat(initialDir, startKind = isOc(S.meta) ? "opencode" : isAgy(S.meta) ? "antigravity" : "pi") {
@@ -2212,6 +2323,7 @@ function activityCard() {
 				a.sessions ? `${a.sessions} chats` : null,
 				a.subagents ? `${a.subagents} subagent runs` : null,
 				a.agyMessages ? `${a.agyMessages} Antigravity messages` : null,
+				a.oc?.sessions ? `${a.oc.sessions} OpenCode chats · ${fmtTokens(a.oc.tokens)}` : null,
 			]
 				.filter(Boolean)
 				.join(" · "),
@@ -2608,11 +2720,17 @@ function updateComposer() {
 	input.placeholder = S.current ? (busy ? "Steer pi while it works…" : "Message pi…") : "";
 	if (isOc(S.meta)) {
 		// OpenCode: the session runs in its background service; a message runs it.
+		const svcStopped = S.ocService?.stopped;
 		$("#btn-stop").hidden = !S.meta.running;
 		$("#composer").classList.toggle("busy", !!S.meta.running);
 		$("#btn-send").title = "Send to OpenCode (Enter)";
 		input.placeholder = "Message OpenCode…";
-		$("#composer-hint").textContent = S.meta.running ? "OpenCode is working; your message joins the queue (Enter) · Esc interrupts" : "Enter sends into this OpenCode session · Esc interrupts a run";
+		input.disabled = !!svcStopped;
+		$("#composer-hint").textContent = svcStopped
+			? "OpenCode is stopped — start it from its pill in the top bar"
+			: S.meta.running
+				? "OpenCode is working; your message joins the queue (Enter) · Esc interrupts"
+				: "Enter sends into this OpenCode session · Esc interrupts a run";
 	} else if (isAgy(S.meta)) {
 		// Antigravity: messages go into the conversation through the app; it can't be stopped from here.
 		$("#btn-stop").hidden = true;
