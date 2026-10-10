@@ -380,6 +380,11 @@ export class Conversation {
 		const items = this.items();
 		this.hasMore = items.length > this.window;
 		const visible = items.slice(-this.window);
+		// Long chats kept every DOM node ever rendered (this.nodes grows forever
+		// while the visible window is 60). Drop the off-window ones; loadEarlier
+		// rebuilds them on demand.
+		const onScreen = new Set(visible.map((i) => i.key));
+		for (const key of this.nodes.keys()) if (!onScreen.has(key)) this.nodes.delete(key);
 		const nodes = [];
 		let previous;
 		for (const [i, item] of visible.entries()) {

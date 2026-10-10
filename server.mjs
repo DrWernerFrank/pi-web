@@ -165,7 +165,16 @@ const agyApp = agyDir ? antigravityAppExe(agyDir) : null;
 // API. Talked to through its background service; sessions appear in the
 // sidebar and chat like pi's (see lib/opencode.mjs for the how).
 const ocBin = process.env.PI_WEB_NO_OPENCODE === "1" ? null : findOpenCodeBin();
-const oc = ocBin ? new OpenCode({ bin: ocBin, home: findOpenCodeHome() }) : null;
+const oc = ocBin
+	? new OpenCode({
+			bin: ocBin,
+			home: findOpenCodeHome(),
+			// Refetch a session's messages only when a page is watching it (see
+			// markDirty): the lib consults this lazily, so `clients` being defined
+			// a few lines below is fine.
+			hasWatcher: (ocId) => [...clients].some((c) => c.sessionId === OC_PREFIX + ocId),
+		})
+	: null;
 const clients = new Set();
 // Runners whose hello arrived before pi flushed their session file; adopted
 // when the file's first upsert lands (a brand-new chat racing a restart).
@@ -195,6 +204,11 @@ async function awaitAgyConversation(id, ms = 10_000) {
 
 const SEARCH_CACHE = new Map(); // file -> { mtimeMs, size, segments }
 const SEARCH_CACHE_MAX = 300;
+// …and by retained TEXT (segments hold every message's words): ~24 MB of
+// searchable history is plenty, and stops a cache of huge chats from
+// quietly becoming the RSS driver.
+const SEARCH_CACHE_MAX_CHARS = 24 * 1024 * 1024;
+let searchCacheChars = 0;
 const SEARCH_MAX_FILE = 5 * 1024 * 1024;
 const SEARCH_MAX_SEGMENTS = 4000;
 
@@ -257,9 +271,18 @@ async function searchSessions(q) {
 		if (!stat.isFile() || stat.size === 0 || stat.size > SEARCH_MAX_FILE) return;
 		let entry = SEARCH_CACHE.get(file);
 		if (!entry || entry.mtimeMs !== stat.mtimeMs || entry.size !== stat.size) {
-			entry = { mtimeMs: stat.mtimeMs, size: stat.size, segments: extractSegments(file, kind) };
-			SEARCH_CACHE.set(file, entry);
-			if (SEARCH_CACHE.size > SEARCH_CACHE_MAX) SEARCH_CACHE.delete(SEARCH_CACHE.keys().next().value);
+			// charge the new entry's text to the budget before evicting by count
+			const next = { mtimeMs: stat.mtimeMs, size: stat.size, segments: extractSegments(file, kind) };
+			const chars = next.segments.reduce((n, s) => n + s.text.length, 0);
+			if (entry) searchCacheChars -= entry.segments.reduce((n, s) => n + s.text.length, 0);
+			searchCacheChars += chars;
+			SEARCH_CACHE.set(file, next);
+			entry = next;
+			while ((searchCacheChars > SEARCH_CACHE_MAX_CHARS || SEARCH_CACHE.size > SEARCH_CACHE_MAX) && SEARCH_CACHE.size > 1) {
+				const oldest = SEARCH_CACHE.keys().next().value;
+				searchCacheChars -= SEARCH_CACHE.get(oldest).segments.reduce((n, s) => n + s.text.length, 0);
+				SEARCH_CACHE.delete(oldest);
+			}
 		}
 		let count = 0;
 		const snippets = [];
@@ -321,32 +344,24 @@ function localDayKey(ts) {
 
 const emptyBucket = () => ({ tokens: 0, messages: 0 });
 
-function computeActivity() {
-	const now = Date.now();
-	const w7 = now - 7 * 86400_000;
-	const w30 = now - 30 * 86400_000;
-	const allTime = { tokens: 0, output: 0, cache: 0, messages: 0, sessions: 0 };
-	const last7 = emptyBucket();
-	const last30 = emptyBucket();
-	const days = new Map(); // local day -> messages that day
-	let firstChat = null;
-	let subagents = 0;
-	let firstSeenOf = (ts) => {
-		if (firstChat == null || ts < firstChat) firstChat = ts;
-	};
-	for (const meta of index.list()) {
-		// Subagent chats are machine-launched: their "user" messages are task
-		// prompts, not things you typed. Count them as runs, not messages.
-		const isSub = !!meta.parentId;
-		if (isSub) subagents++;
-		else allTime.sessions++;
-		let lines;
-		try {
-			lines = fs.readFileSync(meta.file, "utf8");
-		} catch {
-			continue;
-		}
-		for (const line of lines.split("\n")) {
+// Per-file cached activity stats: a live session writes every few seconds,
+// and recomputing used to re-READ every session file on the home page's every
+// refresh (O(all sessions) per message). Now each file is parsed once per
+// change (mtime+size keyed) and the totals merge cached numbers — a write to
+// one chat costs one file read, not 282.
+const activityFiles = new Map(); // file -> { mtimeMs, size, stats }
+function fileActivityStats(file) {
+	let stat;
+	try {
+		stat = fs.statSync(file);
+	} catch {
+		return null;
+	}
+	const hit = activityFiles.get(file);
+	if (hit && hit.mtimeMs === stat.mtimeMs && hit.size === stat.size) return hit.stats;
+	const stats = { dayMsgs: new Map(), dayTokens: new Map(), firstTs: null };
+	try {
+		for (const line of fs.readFileSync(file, "utf8").split("\n")) {
 			if (!line) continue;
 			let d;
 			try {
@@ -358,26 +373,71 @@ function computeActivity() {
 			const m = d.message;
 			if (!m || typeof m !== "object") continue;
 			const ts = typeof m.timestamp === "number" ? m.timestamp : Date.parse(m.timestamp || "") || 0;
-			if (m.role === "user" && !isSub) {
-				allTime.messages++;
-				if (ts) {
-					firstSeenOf(ts);
-					const key = localDayKey(ts);
-					days.set(key, (days.get(key) || 0) + 1);
-				}
-				if (ts >= w7) last7.messages++;
-				if (ts >= w30) last30.messages++;
-			} else if (m.role === "assistant") {
+			if (m.role === "assistant" && m.usage) {
 				const u = m.usage;
-				if (!u) continue;
 				// Reasoning is outside totalTokens (pi reports it separately): count it.
 				const tokens = (Number(u.totalTokens) || (Number(u.input) || 0) + (Number(u.output) || 0) + (Number(u.cacheRead) || 0) + (Number(u.cacheWrite) || 0)) + (Number(u.reasoning) || 0);
-				allTime.tokens += tokens;
-				allTime.output += Number(u.output) || 0;
-				allTime.cache += (Number(u.cacheRead) || 0) + (Number(u.cacheWrite) || 0);
-				if (ts >= w7) last7.tokens += tokens;
-				if (ts >= w30) last30.tokens += tokens;
+				if (ts) {
+					const key = localDayKey(ts);
+					const day = stats.dayTokens.get(key) || { tokens: 0, output: 0, cache: 0 };
+					day.tokens += tokens;
+					day.output += Number(u.output) || 0;
+					day.cache += (Number(u.cacheRead) || 0) + (Number(u.cacheWrite) || 0);
+					stats.dayTokens.set(key, day);
+				}
+			} else if (m.role === "user") {
+				if (ts) {
+					if (stats.firstTs == null || ts < stats.firstTs) stats.firstTs = ts;
+					const key = localDayKey(ts);
+					stats.dayMsgs.set(key, (stats.dayMsgs.get(key) || 0) + 1);
+				}
 			}
+		}
+	} catch {
+		// unreadable: empty stats are honest
+	}
+	const entry = { mtimeMs: stat.mtimeMs, size: stat.size, stats };
+	activityFiles.set(file, entry);
+	if (activityFiles.size > 800) activityFiles.delete(activityFiles.keys().next().value);
+	return stats;
+}
+
+function computeActivity() {
+	const now = Date.now();
+	const w7 = now - 7 * 86400_000;
+	const w30 = now - 30 * 86400_000;
+	const allTime = { tokens: 0, output: 0, cache: 0, messages: 0, sessions: 0 };
+	const last7 = emptyBucket();
+	const last30 = emptyBucket();
+	const days = new Set(); // local days you messaged on
+	let firstChat = null;
+	let subagents = 0;
+	for (const meta of index.list()) {
+		// Subagent chats are machine-launched: their "user" messages are task
+		// prompts, not things you typed. Count them as runs, not messages.
+		const isSub = !!meta.parentId;
+		if (isSub) {
+			subagents++;
+			continue;
+		}
+		allTime.sessions++;
+		const stats = fileActivityStats(meta.file);
+		if (!stats) continue;
+		if (stats.firstTs != null && (firstChat == null || stats.firstTs < firstChat)) firstChat = stats.firstTs;
+		for (const [day, n] of stats.dayMsgs) {
+			days.add(day);
+			allTime.messages += n;
+			const ts = Date.parse(`${day}T12:00:00`); // day-level windows: noon is close enough
+			if (ts >= w7) last7.messages += n;
+			if (ts >= w30) last30.messages += n;
+		}
+		for (const [day, agg] of stats.dayTokens) {
+			allTime.tokens += agg.tokens;
+			allTime.output += agg.output;
+			allTime.cache += agg.cache;
+			const ts = Date.parse(`${day}T12:00:00`);
+			if (ts >= w7) last7.tokens += agg.tokens;
+			if (ts >= w30) last30.tokens += agg.tokens;
 		}
 	}
 	// Antigravity conversations you wrote to (its subagents excluded the same way).
@@ -581,10 +641,10 @@ let clientSeq = 0;
 
 // ── server-sent events ──────────────────────────────────────────────────────
 
-function sse(client, event, data) {
+function sse(client, event, data, preJson) {
 	if (client.res.writableEnded || client.res.destroyed) return;
 	try {
-		client.res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+		client.res.write(`event: ${event}\ndata: ${preJson ?? JSON.stringify(data)}\n\n`);
 	} catch (err) {
 		// A client that died between our check and the write. The 'close'/
 		// 'error' handlers drop it from `clients`; this must not throw or the
@@ -615,14 +675,18 @@ function sseDead(client, err) {
 	}
 }
 function broadcastAll(event, data) {
-	for (const c of clients) sse(c, event, data);
+	if (!clients.size) return;
+	const json = JSON.stringify(data); // once per event, not once per client
+	for (const c of clients) sse(c, event, data, json);
 }
 function broadcastSession(sessionId, event, data) {
 	if (!sessionId) return;
-	for (const c of clients) if (c.sessionId === sessionId) sse(c, event, data);
+	const json = JSON.stringify(data);
+	for (const c of clients) if (c.sessionId === sessionId) sse(c, event, data, json);
 }
 function broadcastFile(file, event, data) {
-	for (const c of clients) if (c.file === file) sse(c, event, data);
+	const json = JSON.stringify(data);
+	for (const c of clients) if (c.file === file) sse(c, event, data, json);
 }
 
 // ── session tails ───────────────────────────────────────────────────────────
@@ -851,33 +915,49 @@ async function startFailed(p, err) {
 let piScan = { at: 0, byFile: new Map() };
 
 /** Live `--session <file>` → pid, for pis that are NOT our children. */
-function terminalPiFiles() {
-	if (Date.now() - piScan.at < 2000) return piScan.byFile;
+function terminalPiFiles(force = false) {
+	if (!force && Date.now() - piScan.at < 5000) return piScan.byFile;
 	const byFile = new Map();
 	const ours = new Set([process.pid]);
-	for (const p of allProcs) if (p.pid) ours.add(p.pid);
-	for (const p of procs.values()) if (p.pid) ours.add(p.pid);
+	const wrapperPids = new Set([process.pid]);
+	for (const p of allProcs) {
+		if (p.pid) {
+			ours.add(p.pid);
+			wrapperPids.add(p.pid); // a starting runner: its pi is ours too
+		}
+	}
+	for (const p of procs.values()) if (p.pid) wrapperPids.add(p.pid); // runner pids
 	try {
 		for (const pidStr of fs.readdirSync("/proc")) {
 			const pid = Number(pidStr);
 			if (!pid || ours.has(pid)) continue;
-		let args;
+			// comm is a few bytes; cmdline is the whole command line. Reading
+			// comms first turns a full-directory scan from "N × cmdline reads"
+			// into "N tiny reads + a couple of cmdline reads" (only real pis).
+			let comm;
 			try {
-				args = fs.readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0");
+				comm = fs.readFileSync(`/proc/${pidStr}/comm`, "utf8").trim();
 			} catch {
 				continue;
 			}
-			if (args.some((a) => a && a.endsWith("wrapper.mjs"))) continue; // our runner, not a pi
+			if (comm !== "pi") continue;
+			let args;
+			try {
+				args = fs.readFileSync(`/proc/${pidStr}/cmdline`, "utf8").split("\0");
+			} catch {
+				continue;
+			}
 			const i = args.indexOf("--session");
 			if (i < 0 || !args[i + 1]) continue;
-			// Whose child is this pi? A runner's (node) = a task that survived
-			// a restart and is coming back; a shell's = the user's terminal.
+			// Whose child is this pi? One of our runners → ours, or a survivor
+			// of a restart (adoptWrapper picks it up). A shell's → the terminal.
 			let orphan = false;
 			try {
-				const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+				const stat = fs.readFileSync(`/proc/${pidStr}/stat`, "utf8");
 				const ppid = Number(stat.slice(stat.lastIndexOf(")") + 2).split(" ")[1]);
-				const comm = fs.readFileSync(`/proc/${ppid}/comm`, "utf8").trim();
-				orphan = /^node/.test(comm);
+				if (wrapperPids.has(ppid)) continue; // our own — its proc state reports it
+				const parentComm = fs.readFileSync(`/proc/${ppid}/comm`, "utf8").trim();
+				orphan = /^node/.test(parentComm);
 			} catch {
 				// parent unreadable: assume the terminal (the cautious default)
 			}
@@ -891,8 +971,8 @@ function terminalPiFiles() {
 }
 
 /** The pi driving this session file, if any: {pid, orphan} or undefined. */
-function externalHolder(file) {
-	return file ? terminalPiFiles().get(file) : undefined;
+function externalHolder(file, force = false) {
+	return file ? terminalPiFiles(force).get(file) : undefined;
 }
 
 /** Is this session currently held by a pi that is not ours? */
@@ -921,7 +1001,7 @@ async function ensureProc(sessionId, { allowTerminalTakeover = false } = {}) {
 			await new Promise((r) => setTimeout(r, 400));
 			p = procs.get(sessionId);
 			if (p && p.state !== "exited" && p.state !== "stopping") return p;
-			if (!externalHolder(meta.file)) break; // it went away: fall through to a spawn
+			if (!externalHolder(meta.file, true)) break; // it went away: fall through to a spawn (fresh scan — this path decides a fork)
 		}
 		if (procs.get(sessionId)) return procs.get(sessionId);
 		throw new HttpError(409, "This chat's pi is reconnecting after the restart — it kept everything it was doing. Send again in a few seconds.");
@@ -1146,14 +1226,30 @@ setInterval(() => {
 
 // ── images referenced by messages ───────────────────────────────────────────
 
-const imageCache = new Map();
+// Image cache, bounded by BYTES not count: sessions regularly embed 5-15 MB
+// screenshots, and 40 of those (the old count cap) is most of the machine's
+// memory budget. 64 MB of hot images is plenty; entries evict LRU.
+const IMAGE_CACHE_MAX_BYTES = 64 * 1024 * 1024;
+const imageCache = new Map(); // key -> { img, bytes }
+let imageCacheBytes = 0;
 function cachedImage(file, ref) {
 	const key = `${file}#${ref}`;
-	if (imageCache.has(key)) return imageCache.get(key);
+	const hit = imageCache.get(key);
+	if (hit) {
+		imageCache.delete(key); // refresh LRU recency
+		imageCache.set(key, hit);
+		return hit.img;
+	}
 	const img = readImage(file, ref);
 	if (img) {
-		imageCache.set(key, img);
-		if (imageCache.size > 40) imageCache.delete(imageCache.keys().next().value);
+		const bytes = img.data?.length || 0;
+		imageCache.set(key, { img, bytes });
+		imageCacheBytes += bytes;
+		while (imageCacheBytes > IMAGE_CACHE_MAX_BYTES && imageCache.size > 1) {
+			const oldest = imageCache.keys().next().value;
+			imageCacheBytes -= imageCache.get(oldest).bytes;
+			imageCache.delete(oldest);
+		}
 	}
 	return img;
 }

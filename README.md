@@ -141,6 +141,22 @@ Chrome (Windows) ──http──▶ pi-web server (Node, in WSL, tmux session "
 - **Context window sizes** come from pi's model catalog (`models-store.json`, your `models.json`) plus what each running pi reports (cached in `~/.cache/pi-web/model-windows.json`). That covers extension models like `claude-bridge/*` after pi-web has run pi once.
 - **Subagent state** is read from the parent session: a launch record, and later a "finished/failed" report. A subagent with no report whose session has been quiet for 15 minutes shows as stopped.
 
+## Performance notes
+
+The goal: a GUI that feels free — idle CPU around a percent of one core, RAM bounded no matter what you throw at it, and no GPU anywhere (verified: the server maps no GPU resources; the page's only GPU work is the browser compositing its CSS — spinners animate transform/opacity, which never touches the main thread).
+
+What keeps it there (all measured on this machine, 282 sessions + 50 OpenCode + 43 Antigravity):
+
+- **Activity card** is incremental: per-file stats cached by mtime+size, so one new message costs one file read, not 282 (it used to re-read every session on each refresh).
+- **Image cache** is bounded by bytes (64 MB, LRU), not by count — 40 cached screenshots used to be potentially hundreds of MB.
+- **Search cache** keeps ~24 MB of message text, LRU-evicted; cached segments make typing cheap.
+- **The /proc scan** (exact "live in terminal" detection) reads each process's 4-byte `comm` before any command line, and caches 5 s — the fork-decision path forces a fresh scan.
+- **OpenCode streaming** refetches a session only while a page actually watches it, and broadcasts only the new entries per step (not the whole 200-message page). Its session poll is a 10 s safety net; SSE delivers everything else instantly.
+- **SSE broadcasts** serialize each event once, not once per connected page.
+- **The sidebar** rebuilds its DOM only when something it shows actually changed (a cheap signature — ticks for group collapse/limits, pins, search, badges, mtimes) instead of every 30 s and on every upsert.
+- **Long chats** drop off-window DOM nodes (the visible window is 60; every node ever rendered used to be kept).
+- The **memory watchdog** (self-restart if RSS > 900 MB or the system is pinched) stays as the backstop; normal operation sits far below it (~150 MB).
+
 ## Settings
 
 Environment variables (set before `pi-web`, e.g. in `~/.bashrc`):

@@ -634,9 +634,29 @@ function togglePinned(s) {
 	renderSessionList();
 }
 
+// The 30-second tick and every sidebar repaint used to rebuild the whole list
+// DOM (hundreds of nodes) even when nothing changed. A cheap signature of
+// everything the list renders skips the rebuild when it would be identical.
+let sessionListSig = "";
 function renderSessionList() {
 	const list = $("#session-list");
 	const q = S.search.trim().toLowerCase();
+	const sig = [
+		q,
+		S.current,
+		S.listTick || 0,
+		S.settings.showSubagents ? 1 : 0,
+		S.settings.showArchived ? 1 : 0,
+		[...pinnedIds()].join(","),
+		[...S.attention].join(","),
+		[...S.searchHits.keys()].join(","),
+		[...S.procs.entries()].map(([id, p]) => `${id}:${p.state}:${p.busy ? 1 : 0}`).join(","),
+		[...S.sessions.values()].map((s) => `${s.id}:${s.mtime || 0}:${s.running ? 1 : 0}:${s.archived ? 1 : 0}:${s.tokens || 0}:${s.name || ""}:${s.firstUser || ""}`).join("|"),
+	].join("#");
+	$("#toggle-subagents").classList.toggle("on", S.settings.showSubagents);
+	$("#toggle-archived").classList.toggle("on", S.settings.showArchived);
+	if (sig === sessionListSig) return; // nothing the list shows has changed
+	sessionListSig = sig;
 	const all = [...S.sessions.values()];
 	const childrenOf = new Map();
 	for (const s of all) {
@@ -706,6 +726,7 @@ function renderSessionList() {
 		);
 		head.onclick = () => {
 			store(collapsedKey, !collapsed);
+			S.listTick = (S.listTick || 0) + 1;
 			renderSessionList();
 		};
 		head.addEventListener("contextmenu", (e) => {
@@ -737,6 +758,7 @@ function renderSessionList() {
 						type: "button",
 						onclick: () => {
 							store(limitKey, limit + 50);
+							S.listTick = (S.listTick || 0) + 1;
 							renderSessionList();
 						},
 					},
@@ -746,8 +768,6 @@ function renderSessionList() {
 		}
 	}
 	list.replaceChildren(frag);
-	$("#toggle-subagents").classList.toggle("on", S.settings.showSubagents);
-	$("#toggle-archived").classList.toggle("on", S.settings.showArchived);
 }
 
 function sessionRow(s, children, inPinBlock = false) {
@@ -1158,15 +1178,18 @@ function openGroupMenu(group, x, y, collapsedKey, collapsed) {
 			{ class: "menu" },
 			entry(collapsed ? "Expand" : "Collapse", collapsed ? "chevronDown" : "chevronRight", () => {
 				store(collapsedKey, !collapsed);
+				S.listTick = (S.listTick || 0) + 1;
 				renderSessionList();
 			}),
 			entry("Show all its chats", "layers", () => {
 				store(`pi-web:limit:${group.cwd}`, 500);
 				store(collapsedKey, false);
+				S.listTick = (S.listTick || 0) + 1;
 				renderSessionList();
 			}),
 			entry("Reset to 25", "refresh", () => {
 				store(`pi-web:limit:${group.cwd}`, 25);
+				S.listTick = (S.listTick || 0) + 1;
 				renderSessionList();
 			}),
 		),
