@@ -101,7 +101,7 @@ A session can be driven by **one** pi at a time.
 - **Reading only**: keep using `learn` / pi in the terminal and keep the page open next to it. The page shows **live in terminal** for that session — detected exactly (the server checks for a live `pi --session <file>` process that isn't its own), not by guessing from file times. If a quiz is waiting, answer it in the terminal: only the pi that asked can receive the answer.
 - **Switching to the browser**: quit pi in the terminal (`/quit`), then type in the page. pi-web starts its own pi on the same session file, with your settings, skills, extensions and project `.pi` config, and continues where you left off.
 - If you send from the page while the terminal pi is still running, pi-web warns you first: two pis on one session fork the conversation.
-- **Restarts are invisible**: when the pi-web server restarts (crash, update, `pi-web stop`/`start`), sessions it was driving come back on their own and open pages reconnect — same pi, same conversation, no “live in terminal”, no re-confirmation. A server restart under a **changed build** reloads open pages once, so you're never running yesterday's JavaScript against a new server.
+- **Restarts are invisible — and tasks keep running**: pi-web's server and the pis it drives are separate processes (a detached runner holds each pi). A restart — crash, update, OOM kill, `pi-web stop`/`start` — costs nothing: mid-run replies keep streaming into the session file, and when the server comes back (seconds) it re-adopts the still-working pis with full control (steering, aborts, model picks). Open pages reconnect on their own; a restart under a **changed build** reloads open pages once, so you're never running yesterday's JavaScript against a new server.
 
 pi processes started by the page stop after 20 minutes idle with no page open on them, or right away with **⋯ → Stop pi** or `/quit`.
 
@@ -133,6 +133,7 @@ Chrome (Windows) ──http──▶ pi-web server (Node, in WSL, tmux session "
 ```
 
 - **RPC mode** streams pi's events to the page and forwards standard extension dialogs.
+- **The runner** (`bridge/wrapper.mjs`): each pi pi-web drives is spawned by a detached runner that holds its stdio, shuttling commands and events over the bridge socket instead of the server holding the pipes. That is what lets a running task survive a pi-web restart — the runner and its pi keep going (pi's RPC pipes break fatally if their holder dies; a server restart used to abort mid-run tasks), and re-attach when the new server comes up. A runner whose pi never got a session file before the restart answers a `get_state` probe from the server, so brand-new chats come home too.
 - **`bridge/pi-web-bridge.ts`** is a small pi extension loaded only into those processes. In RPC mode pi cannot show terminal pop-ups (`ctx.ui.custom()`), which would make quizzes look "cancelled". The bridge sends them to the page over a private socket instead: quiz and ask_user_question become native cards, and any other pop-up is drawn as terminal text you can type into.
 - The server captures your interactive shell environment (`~/.bashrc`: PATH, API keys, `PI_VIZ_DIR`, …) so its pi behaves exactly like the one in your terminal.
 - `![[image.png]]` embeds are looked up in `$PI_VIZ_DIR`, its parent folder (your vault), and the session folder's `viz/`.

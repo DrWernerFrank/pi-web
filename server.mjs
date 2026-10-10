@@ -167,6 +167,14 @@ const agyApp = agyDir ? antigravityAppExe(agyDir) : null;
 const ocBin = process.env.PI_WEB_NO_OPENCODE === "1" ? null : findOpenCodeBin();
 const oc = ocBin ? new OpenCode({ bin: ocBin, home: findOpenCodeHome() }) : null;
 const clients = new Set();
+// Runners whose hello arrived before pi flushed their session file; adopted
+// when the file's first upsert lands (a brand-new chat racing a restart).
+const pendingWrappers = new Map(); // key -> hello msg
+// Runners whose pi started a brand-new session (no --session at spawn): the
+// hello carries no file, so the server asks the pi itself through the runner
+// (get_state) and adopts from the answer.
+const wrapperProbes = new Map(); // key -> {id, pid, timer}
+let wrapperProbeSeq = 0;
 
 /** Wait until the Antigravity index lists a conversation (new ones take a moment to be saved). */
 async function awaitAgyConversation(id, ms = 10_000) {
@@ -542,7 +550,7 @@ function decorated(meta) {
 	// The exact "live in terminal" flag: a terminal pi holds this file. The
 	// browser prefers it over its mtime heuristic (which false-positives on
 	// a web pi that died with a restart).
-	if (m.kind !== "antigravity" && m.kind !== "opencode") m.terminalPi = !!terminalPiFor(m.file);
+	if (m.kind !== "antigravity" && m.kind !== "opencode") m.terminalPi = !!externalHolder(m.file);
 	return m;
 }
 
@@ -558,7 +566,7 @@ function allSessions() {
 			s.reasoning = t.reasoning;
 			s.tokenMessages = t.messages;
 		}
-		if (s.kind !== "antigravity" && s.kind !== "opencode" && s.file) s.terminalPi = !!terminalPiFor(s.file);
+		if (s.kind !== "antigravity" && s.kind !== "opencode" && s.file) s.terminalPi = !!externalHolder(s.file);
 	}
 	return out;
 }
@@ -717,16 +725,9 @@ function procSummary(p) {
 	return { sessionId: p.sessionId, state: p.state, busy: p.live.busy };
 }
 
-function spawnPi({ cwd, sessionFile, expectedId }) {
-	if (!config.piBin) throw new HttpError(500, "pi was not found on PATH. Start pi-web from a shell where `pi` works, or pass --pi <path>.");
-	const p = new PiProcess({
-		config,
-		cwd,
-		sessionFile,
-		bridgeSock: bridgeReady ? sockPath : undefined,
-		bridgeExt: bridgeReady ? BRIDGE_EXT : undefined,
-	});
-	p.sessionId = expectedId;
+/** Everything a PiProcess needs to be part of pi-web: both a fresh spawn and
+ *  a runner that came back after a restart get the same wiring. */
+function wirePi(p) {
 	const sid = () => p.sessionId;
 
 	p.on("event", (ev) => {
@@ -758,7 +759,6 @@ function spawnPi({ cwd, sessionFile, expectedId }) {
 	p.on("moved", (previousId) => {
 		if (procs.get(previousId) === p) procs.delete(previousId);
 		procs.set(p.sessionId, p);
-		writeWatched();
 		if (p.tailFile !== p.sessionFile) {
 			if (p.tailFile) releaseTail(p.tailFile);
 			p.tailFile = p.sessionFile;
@@ -770,7 +770,6 @@ function spawnPi({ cwd, sessionFile, expectedId }) {
 	p.on("exit", (exit) => {
 		allProcs.delete(p);
 		if (procs.get(sid()) === p) procs.delete(sid());
-		writeWatched();
 		// A new chat that never got a reply was never written by pi: drop its placeholder.
 		if (index.pending.has(sid()) && !(p.sessionFile && isFile(p.sessionFile))) {
 			index.pending.delete(sid());
@@ -791,9 +790,48 @@ function spawnPi({ cwd, sessionFile, expectedId }) {
 		}
 	});
 
+	return p;
+}
+
+/** Start a fresh pi (via a detached runner that holds its stdio). */
+function spawnPi({ cwd, sessionFile, expectedId }) {
+	if (!config.piBin) throw new HttpError(500, "pi was not found on PATH. Start pi-web from a shell where `pi` works, or pass --pi <path>.");
+	if (!bridgeReady) throw new HttpError(500, "the bridge socket is not up — restart pi-web (without it, tasks could not survive restarts).");
+	const p = wirePi(new PiProcess({ config, bridge, cwd, sessionFile, bridgeExt: BRIDGE_EXT }));
 	allProcs.add(p);
+	p.sessionId = expectedId;
 	p.start();
 	return p;
+}
+
+/** A detached runner came (back) — a pi that survived a restart of pi-web,
+ *  still on its session, with full control through the runner: steering,
+ *  aborts, model picks, everything stdin ever did. */
+function adoptWrapper(key, msg) {
+	if (procByKey(key) || !msg?.sessionFile) return; // its PiProcess exists / nothing to adopt on
+	const meta = index.getByFile(msg.sessionFile);
+	if (!meta) {
+		pendingWrappers.set(key, msg); // session not flushed yet; retried on its first upsert
+		return;
+	}
+	if (procs.has(meta.id)) return; // a live pi already owns this session
+	// A terminal pi owns this file? then this wrapper's pi is a leftover from a
+	// fork long ago — stop it instead of shadowing the user's terminal.
+	const holder = externalHolder(meta.file);
+	if (holder && !holder.orphan) {
+		bridge.sendWrapper(key, { t: "kill" });
+		return;
+	}
+	const p = wirePi(new PiProcess({ config, bridge, cwd: meta.cwd, sessionFile: meta.file, bridgeExt: BRIDGE_EXT, key }));
+	allProcs.add(p);
+	p.adopt({ pid: msg.pid, sessionFile: meta.file, sessionId: meta.id, busy: msg.busy });
+	procs.set(meta.id, p);
+	p.tailFile = p.sessionFile;
+	if (p.tailFile) acquireTail(p.tailFile);
+	learnModels(p);
+	broadcastSession(meta.id, "proc", procInfo(p));
+	broadcastAll("proc_summary", procSummary(p));
+	console.log(`[pi-web] a pi came back from before the restart (pid ${msg.pid}) for session ${meta.id}`);
 }
 
 async function startFailed(p, err) {
@@ -803,68 +841,6 @@ async function startFailed(p, err) {
 	const tail = p.stderr.slice(-15).join("\n");
 	return new HttpError(500, `pi failed to start: ${err.message}${tail ? `\n\n${tail}` : ""}`);
 }
-
-// ── watched sessions: what survives a restart ─────────────────────────────
-// Users keep pages open on their chats; a pi-web restart used to detach them
-// all (procs live in memory only). Instead, remember every session a proc was
-// attached to — and after a restart, quietly start fresh pis for the ones a
-// page still has open, so “pi ready” comes back on its own.
-
-const WATCHED_FILE = path.join(os.homedir(), ".cache", "pi-web", "watched.json");
-
-function readWatched() {
-	try {
-		const j = JSON.parse(fs.readFileSync(WATCHED_FILE, "utf8"));
-		return Array.isArray(j) ? new Map(j.map((s) => [s.id, s])) : new Map();
-	} catch {
-		return new Map();
-	}
-}
-function writeWatched() {
-	const list = [...procs.values()].filter((p) => !p.adopted && p.sessionId && p.cwd).map((p) => ({ id: p.sessionId, cwd: p.cwd }));
-	watched = new Map(list.map((s) => [s.id, s]));
-	try {
-		fs.mkdirSync(path.dirname(WATCHED_FILE), { recursive: true });
-		fs.writeFileSync(WATCHED_FILE, JSON.stringify(list, null, 2));
-	} catch {
-		// best effort: the in-memory map is the source of truth while running
-	}
-}
-
-/** After a restart: bring the sessions pi-web was driving back to life, so
- *  pages that reconnect see "pi ready (web)" again instead of detaching (and
- *  instead of the "live in terminal" mislabel for our own dead pi's writes).
- *  The most recent chats first; idle pis stop themselves after 20 minutes,
- *  so over-restoring costs nothing. */
-async function restoreWatched() {
-	if (!config.piBin) return;
-	const entries = [...watched.values()]
-		.filter((s) => s.id && !isAgy(s.id) && !isOc(s.id))
-		.map((s) => ({ ...s, mtime: index.get(s.id)?.mtime || 0 }))
-		.sort((a, b) => b.mtime - a.mtime)
-		.slice(0, 3);
-	for (const s of entries) {
-		// Never restore onto a session a terminal pi is writing right now:
-		// that web pi would fork it and mask the "live in terminal" state.
-		const meta = index.get(s.id);
-		if (externallyDriven(meta)) {
-			console.log(`[pi-web] restore skipped for ${s.id}: live in a terminal — read-only here`);
-			watched.delete(s.id);
-			writeWatched();
-			continue;
-		}
-		try {
-			await ensureProc(s.id);
-			console.log(`[pi-web] restored pi for ${s.id}`);
-		} catch (err) {
-			// unreadable/gone: the page shows the honest state for it
-			console.warn(`[pi-web] restore skipped for ${s.id}: ${err.message}`);
-			watched.delete(s.id);
-			writeWatched();
-		}
-	}
-}
-let watched = readWatched();
 
 // ── which sessions a terminal pi is driving ────────────────────────────
 // A web pi that died with a restart also wrote the file moments ago, so a
@@ -891,8 +867,21 @@ function terminalPiFiles() {
 			} catch {
 				continue;
 			}
+			if (args.some((a) => a && a.endsWith("wrapper.mjs"))) continue; // our runner, not a pi
 			const i = args.indexOf("--session");
-			if (i >= 0 && args[i + 1]) byFile.set(args[i + 1], pid);
+			if (i < 0 || !args[i + 1]) continue;
+			// Whose child is this pi? A runner's (node) = a task that survived
+			// a restart and is coming back; a shell's = the user's terminal.
+			let orphan = false;
+			try {
+				const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+				const ppid = Number(stat.slice(stat.lastIndexOf(")") + 2).split(" ")[1]);
+				const comm = fs.readFileSync(`/proc/${ppid}/comm`, "utf8").trim();
+				orphan = /^node/.test(comm);
+			} catch {
+				// parent unreadable: assume the terminal (the cautious default)
+			}
+			byFile.set(args[i + 1], { pid, orphan });
 		}
 	} catch {
 		// /proc unreadable (not Linux): no terminal pis detectable
@@ -901,25 +890,18 @@ function terminalPiFiles() {
 	return byFile;
 }
 
-/** The terminal pi driving this session file (its pid), or undefined. */
-function terminalPiFor(file) {
+/** The pi driving this session file, if any: {pid, orphan} or undefined. */
+function externalHolder(file) {
 	return file ? terminalPiFiles().get(file) : undefined;
 }
 
 /** Is this session currently held by a pi that is not ours? */
 function externallyDriven(meta) {
-	return !!terminalPiFor(meta?.file);
+	return !!externalHolder(meta?.file);
 }
 
-async function ensureProc(sessionId, { allowExternal = false } = {}) {
+async function ensureProc(sessionId, { allowTerminalTakeover = false } = {}) {
 	let p = procs.get(sessionId);
-	if (p?.adopted) {
-		// A pi that outlived a crash: fine for answering its open quizzes, but
-		// its stdin is gone. Stop it and start a clean one on the same session.
-		p.stop();
-		procs.delete(sessionId);
-		p = undefined;
-	}
 	if (p && p.state !== "exited" && p.state !== "stopping") {
 		await p.ready;
 		return p;
@@ -928,11 +910,23 @@ async function ensureProc(sessionId, { allowExternal = false } = {}) {
 	const meta = index.get(sessionId);
 	if (!meta) throw new HttpError(404, "Unknown session");
 	if (meta.pending) throw new HttpError(409, "pi never saved this session. Start a new chat instead.");
-	// Another pi (your terminal) is writing this file right now: a web pi here
-	// would fork the conversation and mask the "live in terminal" state.
-	// Deliberate take-overs (a confirmed send, the menu's Start) pass
-	// allowExternal; background spawns (restore, prewarm, pickers) do not.
-	if (!allowExternal && externallyDriven(meta)) throw new HttpError(409, "This session is being written by another pi (your terminal?) — it stays read-only here while it is active.");
+	// Who holds this session right now?
+	//  - a runner from before a restart (orphan): it is coming back in seconds
+	//    with everything it was doing — wait for it; never fork the session.
+	//  - the user's terminal pi: read-only here unless a takeover was chosen.
+	const holder = externalHolder(meta.file);
+	if (holder?.orphan) {
+		const until = Date.now() + 8000;
+		while (Date.now() < until) {
+			await new Promise((r) => setTimeout(r, 400));
+			p = procs.get(sessionId);
+			if (p && p.state !== "exited" && p.state !== "stopping") return p;
+			if (!externalHolder(meta.file)) break; // it went away: fall through to a spawn
+		}
+		if (procs.get(sessionId)) return procs.get(sessionId);
+		throw new HttpError(409, "This chat's pi is reconnecting after the restart — it kept everything it was doing. Send again in a few seconds.");
+	}
+	if (holder && !allowTerminalTakeover) throw new HttpError(409, "This session is being written by another pi (your terminal?) — it stays read-only here while it is active.");
 	if (!meta.cwd) throw new HttpError(400, "This session file does not record its working folder.");
 	if (!isDir(meta.cwd)) throw new HttpError(400, `The session's folder no longer exists: ${meta.cwd}`);
 	p = spawnPi({ cwd: meta.cwd, sessionFile: meta.file, expectedId: sessionId });
@@ -947,7 +941,6 @@ async function ensureProc(sessionId, { allowExternal = false } = {}) {
 	p.tailFile = p.sessionFile;
 	if (p.tailFile) acquireTail(p.tailFile);
 	learnModels(p);
-	writeWatched();
 	return p;
 }
 
@@ -965,7 +958,6 @@ async function newSession(cwd) {
 	p.tailFile = p.sessionFile;
 	if (p.tailFile) acquireTail(p.tailFile);
 	learnModels(p);
-	writeWatched();
 	return p.sessionId;
 }
 
@@ -983,54 +975,6 @@ function procByKey(key) {
 	return undefined;
 }
 
-/** A pi that survived a pi-web crash: its stdin died with the old server, but
- *  its bridge socket can re-attach (the Bridge re-attaches by key on hello).
- *  Adopt it so its open quizzes stay answerable; the next real message swaps
- *  it for a clean pi on the same session file (see ensureProc). */
-function adoptOrphan(key, pid) {
-	let args;
-	try {
-		args = fs.readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0");
-	} catch {
-		return undefined;
-	}
-	const i = args.indexOf("--session");
-	if (i < 0 || !args[i + 1]) return undefined;
-	const meta = index.getByFile(args[i + 1]);
-	if (!meta || procs.has(meta.id)) return undefined; // a live server-spawned pi owns it
-	const stub = {
-		key,
-		sessionId: meta.id,
-		sessionFile: meta.file,
-		sessionName: meta.name,
-		cwd: meta.cwd,
-		adopted: true,
-		pid,
-		state: "ready",
-		startedAt: Date.now(),
-		live: createLive(),
-		info() {
-			return { state: "ready", pid, adopted: true, sessionId: this.sessionId, sessionFile: this.sessionFile, sessionName: this.sessionName, busy: this.live.busy };
-		},
-		write() {
-			return false; // stdin went with the old server
-		},
-		request() {
-			return Promise.reject(new Error("this pi survived a pi-web restart; it is being replaced"));
-		},
-		stop() {
-			try {
-				process.kill(pid, "SIGTERM");
-			} catch {
-				// already gone
-			}
-		},
-	};
-	procs.set(meta.id, stub);
-	console.log(`[pi-web] adopted orphan pi (pid ${pid}) for session ${meta.id}`);
-	return stub;
-}
-
 /** Unblock anything pi is waiting on from the user (used before aborting). */
 function cancelInteractive(p) {
 	for (const uid of Object.keys(p.live.bridge)) bridge.send(p.key, { t: "ui_cancel", uid });
@@ -1041,9 +985,9 @@ function cancelInteractive(p) {
 	}
 }
 
-bridge.on("connect", (key, pid) => {
-	let p = procByKey(key);
-	if (!p && typeof pid === "number") p = adoptOrphan(key, pid);
+bridge.on("connect", (key) => {
+	// the quiz bridge inside a pi we drive
+	const p = procByKey(key);
 	if (!p) return;
 	p.bridgeConnected = true;
 	broadcastSession(p.sessionId, "proc", procInfo(p));
@@ -1085,6 +1029,36 @@ bridge.on("message", (key, msg) => {
 			broadcastSession(sid, "widget", { key: msg.key, widget: p.live.widgets[msg.key] ?? null });
 			break;
 	}
+});
+
+// A detached runner (re)attached: a pi we spawned — or one that survived a
+// restart and is coming home. Known file → adopt at once. No file (its pi
+// started a brand-new session before the restart) → ask the pi itself.
+bridge.on("wrapper", (key, msg) => {
+	if (procByKey(key)) return; // its own PiProcess already handles it
+	if (msg?.sessionFile) return adoptWrapper(key, msg);
+	const id = `probe-${++wrapperProbeSeq}`;
+	const entry = { id, pid: msg?.pid, timer: null };
+	entry.timer = setTimeout(() => wrapperProbes.delete(key), 6000).unref?.();
+	wrapperProbes.set(key, entry);
+	bridge.sendWrapper(key, { t: "stdin", line: `${JSON.stringify({ type: "get_state", id })}\n` });
+});
+
+// The get_state answer of a probed runner: adopt the pi from what it reports.
+bridge.on("message", (key, msg, wrapper) => {
+	if (!wrapper || msg.t !== "rpc") return;
+	const probe = wrapperProbes.get(key);
+	if (!probe) return;
+	let rec;
+	try {
+		rec = JSON.parse(msg.line);
+	} catch {
+		return;
+	}
+	if (rec.type !== "response" || rec.id !== probe.id || !rec.success) return wrapperProbes.delete(key);
+	wrapperProbes.delete(key);
+	clearTimeout(probe.timer);
+	if (rec.data?.sessionFile) adoptWrapper(key, { ...msg, pid: probe.pid, sessionFile: rec.data.sessionFile });
 });
 
 // ── OpenCode events → browser ────────────────────────────────────────────
@@ -1434,7 +1408,7 @@ async function handleApiPost(route, body) {
 				setTimeout(() => agy.refresh().catch(() => {}), 1500);
 				return { ok: true };
 			}
-			const p = await ensureProc(session, { allowExternal: true }); // the browser warned about the fork if it could tell
+			const p = await ensureProc(session, { allowTerminalTakeover: true }); // the browser warned about the fork if it could tell
 			const command = { type: "prompt", message, streamingBehavior: behavior === "followUp" ? "followUp" : "steer" };
 			if (hasImages) {
 				command.images = images
@@ -1627,7 +1601,7 @@ async function handleApiPost(route, body) {
 		case "/api/process": {
 			const { session, action } = body;
 			if (isOc(session)) throw new HttpError(400, "OpenCode sessions run in the OpenCode service; there is no separate process to start or stop here.");
-			if (action === "start") return { ok: true, proc: (await ensureProc(session, { allowExternal: !body.prewarm })).info() };
+			if (action === "start") return { ok: true, proc: (await ensureProc(session, { allowTerminalTakeover: !body.prewarm })).info() };
 			if (action === "stop") {
 				const p = procs.get(session);
 				if (p) {
@@ -1886,8 +1860,16 @@ const server = http.createServer((req, res) => {
 index.on("upsert", (meta) => {
 	meta.archived = archived.has(meta.id);
 	// Ship the exact terminal-pi flag with every meta the browser sees.
-	if (meta.file) meta.terminalPi = !!terminalPiFor(meta.file);
+	if (meta.file) meta.terminalPi = !!externalHolder(meta.file);
 	broadcastAll("session_upsert", meta);
+	// A runner said hello before pi had flushed its (brand-new) session file;
+	// the file exists now — bring it home.
+	for (const [key, msg] of [...pendingWrappers.entries()]) {
+		if (msg.sessionFile === meta.file) {
+			pendingWrappers.delete(key);
+			adoptWrapper(key, msg);
+		}
+	}
 });
 index.on("remove", (id) => broadcastAll("session_remove", { id }));
 
@@ -1925,6 +1907,11 @@ process.on("unhandledRejection", (err) => {
 
 function shutdown() {
 	for (const p of allProcs) {
+		// A pi mid-task (or waiting on a quiz) survives the restart: its runner
+		// is detached and holds its stdio, the reply keeps landing in the
+		// session file, and the new server re-adopts it with full control.
+		// Stopping it here is what used to kill tasks on every restart.
+		if (p.live?.busy || Object.keys(p.live?.dialogs || {}).length || Object.keys(p.live?.bridge || {}).length) continue;
 		p.stopRequested = true;
 		p.stop();
 	}
@@ -1939,7 +1926,6 @@ process.on("SIGHUP", shutdown);
 
 await index.scan();
 index.watch();
-void restoreWatched(); // bring back the chats pi-web was driving (pages reconnect to them)
 if (agy) {
 	agy.on("upsert", (meta) => { meta.archived = archived.has(meta.id); broadcastAll("session_upsert", meta); });
 	agy.on("remove", (id) => broadcastAll("session_remove", { id }));
