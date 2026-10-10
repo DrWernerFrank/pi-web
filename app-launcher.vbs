@@ -1,11 +1,13 @@
 ' Pi Web — Windows app launcher.
 ' Ensures the pi-web server is running inside WSL (hidden window), then opens
-' Chrome in app mode: its own window on the taskbar, with pi-web's icon.
-' The shortcut in the Start menu points here.
+' the app: PiWebHost.exe (a native window hosting the page in WebView2 — no
+' browser, no profile, no extensions) when built, or a Chrome app window as
+' the fallback. The shortcut in the Start menu points here.
 
 Option Explicit
-Dim shell, ready, tries
+Dim shell, ready, tries, fso, host
 Set shell = CreateObject("WScript.Shell")
+Set fso = CreateObject("Scripting.FileSystemObject")
 
 Function ServerUp()
 	On Error Resume Next
@@ -38,7 +40,16 @@ Else
 End If
 
 If ready Then
-	shell.Run """C:\Program Files\Google\Chrome\Application\chrome.exe"" --app=http://localhost:3141/", 1, False
+	host = fso.GetParentFolderName(fso.GetParentFolderName(WScript.ScriptFullName)) & "\host\PiWebHost.exe"
+	If fso.FileExists(host) Then
+		' The native window: WebView2 hosts the page (measured ~420MB total,
+		' vs ~600MB for a dedicated-profile Chrome window — and it never touches
+		' your browsing browser at all). Build it once with host\get-webview2.ps1
+		' then host\build.ps1.
+		shell.Run """" & host & """", 1, False
+	Else
+		shell.Run """C:\Program Files\Google\Chrome\Application\chrome.exe"" --app=http://localhost:3141/", 1, False
+	End If
 Else
 	MsgBox "pi-web did not start within two minutes." & vbCrLf & vbCrLf & _
 		"Open a WSL terminal and run:  pi-web logs" & vbCrLf & _

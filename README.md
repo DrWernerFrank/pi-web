@@ -55,12 +55,14 @@ Subagents are spawned with `--no-extensions` and only the extensions backing the
 
 So an agent that needs an image read dispatches a worker/researcher with the path, and the subagent calls `read_image`. A model that can see images itself can call the tool directly too.
 
-## As a Windows app
+## As a Windows app (native, no browser)
 
-**“Pi Web” is in your Start menu** — type `pi` after opening it. It opens as its own app window (no browser chrome), with the π icon.
+**“Pi Web” is in your Start menu** — type `pi` after opening it. It opens as a **native window**: a 5 KB host (`host/PiWebHost.exe`) that renders the page in **WebView2** — the same engine Tauri uses, shipped with Windows 11 — with the π icon. No browser, no profile, no extensions, no tabs; it never touches your browsing Chrome at all.
 
-- The shortcut runs `app-launcher.vbs`: it checks the server, starts it inside WSL (hidden) if needed, waits up to two minutes, then opens Chrome in app mode. If it can't come up, it says so instead of failing silently.
-- The icon (`pi-web.ico`, 256/48/32/16, built from the π logo) is also served as `/favicon.ico`, so the app window and tabs use it.
+- The shortcut runs `app-launcher.vbs`: it checks the server, starts it inside WSL (hidden) if needed, waits up to two minutes, then opens the native window (or a Chrome app window as fallback if the host isn't built).
+- Building the host (one-time, no SDK or installs): `host/get-webview2.ps1` (downloads the two WebView2 DLLs) then `host/build.ps1` — compiled with the C# compiler Windows already carries. Its log, if you ever need it: `%LOCALAPPDATA%\pi-web\host.log`.
+- **Measured on this machine**: the native window costs ~420 MB total (host + its WebView2 tree — most of it is the page itself: math, diagrams, a long chat); a dedicated-profile Chrome window costs ~600 MB; living inside your browsing Chrome entangles it with your 2+ GB browser. The webview keeps its data in `%LOCALAPPDATA%\pi-web\webview` — nothing is synced, nothing lands in your browser.
+- The icon (`pi-web.ico`, 256/48/32/16, built from the π logo) is also served as `/favicon.ico`.
 - To pin it to the taskbar: right-click the Start-menu entry → **Pin to taskbar**. A desktop copy: right-click → Open file location → drag to the Desktop.
 - Re-create the shortcut after moving the folder: `powershell.exe -ExecutionPolicy Bypass -File make-shortcut.ps1` (run from the folder).
 
@@ -156,6 +158,7 @@ What keeps it there (all measured on this machine, 282 sessions + 50 OpenCode + 
 - **The sidebar** rebuilds its DOM only when something it shows actually changed (a cheap signature — ticks for group collapse/limits, pins, search, badges, mtimes) instead of every 30 s and on every upsert.
 - **Long chats** drop off-window DOM nodes (the visible window is 60; every node ever rendered used to be kept).
 - The **memory watchdog** (self-restart if RSS > 900 MB or the system is pinched) stays as the backstop; normal operation sits far below it (~150 MB).
+- The **app window itself** is native: `host/PiWebHost.exe` hosts the page in WebView2 — measured ~420 MB total vs ~600 MB for a dedicated-profile Chrome window, and it never lives inside your browsing browser (see "As a Windows app").
 
 ## Settings
 

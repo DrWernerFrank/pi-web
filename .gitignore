@@ -37,3 +37,8 @@ desktop.ini
 
 # this repo's local working copy of the paper (kept out on purpose)
 AI_in_Mathematics_Paper.md
+
+# the native app shell's build artifacts (host/get-webview2.ps1 + build.ps1 rebuild them)
+host/nuget/
+host/*.dll
+host/*.exe
