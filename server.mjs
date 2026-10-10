@@ -1589,8 +1589,9 @@ async function handleApiPost(route, body) {
 				const meta = oc.get(session);
 				if (!meta) throw new HttpError(404, "Unknown session");
 				if (command.type === "abort") {
-					await oc.interrupt(meta.ocId).catch((err) => { throw new HttpError(err.status || 502, err.message); });
-					return { ok: true, data: null };
+					// Returns {interrupted} — false when nothing was running (the UI says so).
+					const r = await oc.interrupt(meta.ocId).catch((err) => { throw new HttpError(err.status || 502, err.message); });
+					return { ok: true, data: r };
 				}
 				if (command.type === "set_session_name") {
 					await oc.rename(meta.ocId, String(command.name || "").trim()).catch((err) => { throw new HttpError(err.status || 502, err.message); });

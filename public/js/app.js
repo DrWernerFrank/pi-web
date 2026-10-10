@@ -1270,9 +1270,22 @@ function openMenu(anchor) {
 	const running = hasProcess();
 	const ocItems = isOc(S.meta)
 		? [
+				// OpenCode's stop: interrupt the run this session is on. Idle sessions
+				// cost nothing (they live in the shared service, not a process), so
+				// the item only exists while a run is going.
+				S.meta?.running
+					? item("Stop this session", "stop", async () => {
+						try {
+							const data = await rpc(S.current, { type: "abort" });
+							toast(data?.interrupted === false ? "This session wasn't running — nothing to stop." : "OpenCode: stopping…", data?.interrupted === false ? "warn" : "info");
+						} catch (err) {
+							toast(err.message, "error");
+						}
+					})
+					: null,
 				item("Rename…", "note", renameSession),
 				item("Session info", "note", sessionInfo),
-				h("div", { class: "menu-note" }, `OpenCode ${S.server?.ocVersion || ""} · managed by its own background service`),
+				h("div", { class: "menu-note" }, `OpenCode ${S.server?.ocVersion || ""} · runs in its own background service; idle sessions cost nothing`),
 				h("div", { class: "menu-sep" }),
 			]
 		: [];
