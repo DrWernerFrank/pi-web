@@ -39,6 +39,10 @@ Environment:
   PI_WEB_ALLOWED_HOSTS   Extra Host headers to accept (','-separated), e.g. when binding 0.0.0.0
   PI_WEB_PI_ARGS         Extra arguments for every pi process
   PI_WEB_NO_ENV_CAPTURE  Set to 1 to skip reading your shell's environment for pi
+  PI_WEB_NO_ANTIGRAVITY  Set to 1 to hide the Antigravity integration
+  PI_WEB_NO_OPENCODE     Set to 1 to hide the OpenCode integration
+  PI_WEB_OPENCODE_PORT   Port for pi-web's own OpenCode server, if one is ever
+                         needed (NAT-mode WSL only; default 4196)
 `;
 
 let config;
@@ -1687,7 +1691,7 @@ async function handleApiPost(route, body) {
 			if (!oc) throw new HttpError(404, "OpenCode was not found on this machine.");
 			const meta = oc.get(body.session);
 			if (!meta) throw new HttpError(404, "Unknown session");
-			if (body.cancelled) await oc.api(`/api/session/${meta.ocId}/form/${body.form}/cancel`, { method: "DELETE" }).catch((err) => { throw new HttpError(err.status || 502, err.message); });
+			if (body.cancelled) await oc.api(`/api/session/${meta.ocId}/form/${body.form}`, { method: "DELETE" }).catch((err) => { throw new HttpError(err.status || 502, err.message); }); // cancel IS the form's DELETE
 			else await oc.replyForm(meta.ocId, body.form, body.answer || {}).catch((err) => { throw new HttpError(err.status || 502, err.message); });
 			return { ok: true };
 		}

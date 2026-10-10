@@ -81,13 +81,27 @@ pi-web run        # run in this terminal instead (Ctrl+C stops it)
 
 `pi-web` is a link in `~/.local/bin` to `bin/pi-web` in this folder.
 
+## OpenCode, in the same place
+
+If [OpenCode](https://opencode.ai) is installed on the Windows side (`npm i -g @opencode/cli`), its sessions appear in the sidebar under **OpenCode**, next to your pi sessions — reading, chatting, subagents and all.
+
+- **Reading** covers every session OpenCode has stored, live: thinking, tool calls with their output, and per-step token/cost counts on each reply. The sidebar groups them by their Windows project folder and shows each session's token total.
+- **Chatting** goes through OpenCode's own **background service** — the same server the Windows CLI uses (`opencode service`), reached over WSL's mirrored localhost. Nothing extra is started on this machine; on NAT-mode WSL, pi-web starts an `opencode serve` bound to the WSL host only, never `0.0.0.0`. The service's password is read from `%USERPROFILE%\.local\state\opencode\service.json` — the same file the CLI reads — and never stored anywhere else.
+- **New chat → OpenCode** starts a session there (first message, model, agent, title, project folder), and the message box continues an existing one: replies stream in with thinking and tool cards, Enter sends, **Esc interrupts**, the model/agent picker switches mid-session, rename via `/name`, delete from the right-click menu.
+- **Subagents** are OpenCode child sessions (`parentID`) — they bridge onto the same UX as pi's: launch cards in the chat, the running strip above the message box, and **Watch** in the side panel following them live. A `question` tool it asks renders as the ask card, with the recorded answer.
+- **Forms and permission asks** from OpenCode agents (its structured-question and allow/deny prompts) appear as dialogs in the page; answers go straight back to the agent.
+- Sessions mid-run when pi-web starts (from your own terminal) are marked running via the service's active-session list; `PI_WEB_NO_OPENCODE=1` hides the whole integration, `PI_WEB_OPENCODE_PORT` changes the fallback server's port (default 4196, log at `~/.cache/pi-web/opencode-serve.log`).
+
+How: OpenCode v2's HTTP API + SSE event stream, converted into pi's own session shapes (`lib/opencode.mjs`) — the same renderer draws both. Session ids are prefixed `oc-` in routes and the sidebar.
+
 ## Using it with pi in the terminal
 
 A session can be driven by **one** pi at a time.
 
-- **Reading only**: keep using `learn` / pi in the terminal and keep the page open next to it. The page shows **live in terminal** for that session. If a quiz is waiting, answer it in the terminal: only the pi that asked can receive the answer.
+- **Reading only**: keep using `learn` / pi in the terminal and keep the page open next to it. The page shows **live in terminal** for that session — detected exactly (the server checks for a live `pi --session <file>` process that isn't its own), not by guessing from file times. If a quiz is waiting, answer it in the terminal: only the pi that asked can receive the answer.
 - **Switching to the browser**: quit pi in the terminal (`/quit`), then type in the page. pi-web starts its own pi on the same session file, with your settings, skills, extensions and project `.pi` config, and continues where you left off.
 - If you send from the page while the terminal pi is still running, pi-web warns you first: two pis on one session fork the conversation.
+- **Restarts are invisible**: when the pi-web server restarts (crash, update, `pi-web stop`/`start`), sessions it was driving come back on their own and open pages reconnect — same pi, same conversation, no “live in terminal”, no re-confirmation. A server restart under a **changed build** reloads open pages once, so you're never running yesterday's JavaScript against a new server.
 
 pi processes started by the page stop after 20 minutes idle with no page open on them, or right away with **⋯ → Stop pi** or `/quit`.
 

@@ -1809,9 +1809,23 @@ function openOcForm(form) {
 	for (const f of form.fields || []) {
 		if (f.hidden) continue;
 		const field = ocFieldInput(f);
-		fields.push({ key: f.key, required: f.required, el: field.el, read: field.read });
+		fields.push({ key: f.key, required: f.required, when: f.when, el: field.el, read: field.read });
 	}
 	const answer = () => Object.assign({}, ...fields.map((f) => f.read()));
+	// when-conditions: a field whose condition isn't met by the current
+	// answers is left out of the reply (OpenCode applies the same rule
+	// server-side; this keeps the payload honest).
+	const visibleFields = () => {
+		const current = answer();
+		return fields.filter((f) =>
+			!(f.when || []).some((w) => {
+				const cur = current[w.key];
+			const a = cur == null ? "" : String(cur);
+			const b = w.value == null ? "" : String(w.value);
+			return w.op === "eq" ? a !== b : a === b;
+			}),
+		);
+	};
 	const send = async (cancelled) => {
 		const done = (backdrop) => {
 			backdrop.remove();
@@ -1823,12 +1837,12 @@ function openOcForm(form) {
 			done(backdrop);
 			return;
 		}
-		const missing = fields.filter((f) => f.required && !String(answer()[f.key] ?? "").trim());
+		const missing = visibleFields().filter((f) => f.required && !String(answer()[f.key] ?? "").trim());
 		if (missing.length) {
 			toast(`“${missing[0].key}” is required.`, "warn");
 			return;
 		}
-		post("/api/oc/form", { session: OC_SESS(form.sessionID), form: form.id, answer: answer() }).catch((err) => toast(err.message, "error"));
+		post("/api/oc/form", { session: OC_SESS(form.sessionID), form: form.id, answer: Object.assign({}, ...visibleFields().map((f) => f.read())) }).catch((err) => toast(err.message, "error"));
 		done(backdrop);
 	};
 	const backdrop = h(
@@ -2670,6 +2684,7 @@ const OC_COMMANDS = [
 	{ name: "new", description: "Start a new chat" },
 	{ name: "resume", description: "Find another session" },
 	{ name: "session", description: "Session id and usage" },
+	{ name: "copy", description: "Copy the last reply" },
 ];
 
 function updateSlashMenu() {
@@ -2824,6 +2839,10 @@ async function builtinCommand(text) {
 			exportHtml();
 			return true;
 		case "quit":
+			if (isOc(S.meta)) {
+				toast("OpenCode sessions run in their own service — interrupt with Esc, or delete the session from its right-click menu.", "info");
+				return true;
+			}
 			stopProcess();
 			return true;
 		default:
