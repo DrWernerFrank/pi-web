@@ -243,11 +243,25 @@ function isAgy(meta) {
 	return meta?.kind === "antigravity";
 }
 
+function isOc(meta) {
+	return meta?.kind === "opencode";
+}
+
+/** An OpenCode child session id (routed "oc-ses_…"), used as the subagent key. */
+function isOcIdStr(id) {
+	return typeof id === "string" && id.startsWith("oc-");
+}
+
 function isExternallyActive(meta) {
 	if (!meta) return false;
 	if (isAgy(meta)) return !!meta.running;
+	if (isOc(meta)) return !!meta.running;
 	const proc = S.procs.get(meta.id);
 	if (proc && proc.state !== "exited") return false;
+	// The server read /proc: a terminal pi is live on this session or not —
+	// exact, unlike the mtime heuristic (a web pi that died with a restart
+	// also wrote the file moments ago; that must look OURS to reconnect).
+	if (meta.terminalPi != null) return !!meta.terminalPi;
 	return Date.now() - (meta.mtime || 0) < EXTERNAL_WINDOW_MS;
 }
 
@@ -283,8 +297,18 @@ function subagentInfo(file, parent) {
 			if (sub) break;
 		}
 	}
-	const child = S.byFile.get(file);
+	const child = S.byFile.get(file) || (isOcIdStr(file) ? S.sessions.get(file) : null);
 	const info = sub ? { ...sub } : { file, agent: child?.agent, name: child?.agentName };
+	// OpenCode children: full sessions of their own (their routed id IS the key
+	// "file"), live status from the session list; no file to stat.
+	if (isOcIdStr(file)) {
+		info.agent ??= child?.agent;
+		info.name ??= child?.agentName || child?.firstUser;
+		info.state = child ? (child.running ? "running" : child.outcome === "failed" ? "failed" : "done") : sub?.done ? (sub.failed ? "failed" : "done") : "running";
+		info.childId = sub?.childId || child?.id || file;
+		info.lastActivity = toMs(child?.lastActivity) || toMs(sub?.launchedAt) || 0;
+		return info;
+	}
 	const last = child ? Math.max(child.mtime || 0, toMs(child.lastActivity)) : toMs(info.launchedAt);
 	if (isAgy(child)) {
 		// Antigravity says itself whether a conversation is still working.
@@ -481,6 +505,14 @@ function connect(id) {
 		t.addEventListener("click", () => navigate(sessionId));
 	});
 	on("notice", ({ level, message, detail }) => toast(message, level || "info", detail));
+	on("oc_form", ({ form, open }) => {
+		if (open) openOcForm(form);
+		else closeOcForm(form.id);
+	});
+	on("oc_permission", ({ request, open }) => {
+		if (open) openOcPermission(request);
+		else closeOcPermission(request.id);
+	});
 	on("moved", ({ to }) => navigate(to));
 }
 
@@ -507,6 +539,13 @@ function reloadWhenServerBack() {
 }
 
 function onHello(data) {
+	// A server restarted under a new build: this page's JS is stale (SSE
+	// reconnects silently, but old code can't drive new features). Reload once.
+	if (S.loadedCommit && data.commit && data.commit !== S.loadedCommit) {
+		location.reload();
+		return;
+	}
+	S.loadedCommit = data.commit || S.loadedCommit;
 	S.home = data.home || "";
 	S.server = data;
 	S.sessions = new Map((data.sessions || []).map((s) => [s.id, s]));
@@ -613,16 +652,17 @@ function renderSessionList() {
 	});
 	const groups = new Map();
 	for (const s of visible) {
-		const key = isAgy(s) ? `antigravity:${s.cwd || ""}` : s.cwd || "";
+		const key = isOc(s) ? `opencode:${s.cwd || ""}` : isAgy(s) ? `antigravity:${s.cwd || ""}` : s.cwd || "";
 		if (!groups.has(key)) groups.set(key, []);
 		groups.get(key).push(s);
 	}
 	const ordered = [...groups.entries()]
 		.map(([key, items]) => {
+			const oc = key.startsWith("opencode:");
 			const agy = key.startsWith("antigravity:");
-			const cwd = agy ? key.slice("antigravity:".length) : key;
-			const label = agy ? `Antigravity${cwd ? ` · ${prettyPath(cwd, S.home)}` : ""}` : prettyPath(cwd, S.home) || "(unknown folder)";
-			return { cwd: key, label, agy, items: items.sort((a, b) => activity(b) - activity(a)) };
+			const cwd = oc ? key.slice("opencode:".length) : agy ? key.slice("antigravity:".length) : key;
+			const label = oc ? `OpenCode${cwd ? ` · ${prettyPath(cwd, S.home)}` : ""}` : agy ? `Antigravity${cwd ? ` · ${prettyPath(cwd, S.home)}` : ""}` : prettyPath(cwd, S.home) || "(unknown folder)";
+			return { cwd: key, label, agy, oc, items: items.sort((a, b) => activity(b) - activity(a)) };
 		})
 		.sort((a, b) => activity(b.items[0]) - activity(a.items[0]));
 
@@ -657,9 +697,10 @@ function renderSessionList() {
 		if (!collapsed && group.items.some((s) => s.id === S.current)) store(collapsedKey, false);
 		const head = h(
 			"button",
-			{ class: `group-head${group.agy ? " agy" : ""}`, type: "button", title: group.agy ? "Google Antigravity conversations" : group.cwd, "aria-expanded": String(!collapsed) },
+			{ class: `group-head${group.agy ? " agy" : ""}${group.oc ? " oc" : ""}`, type: "button", title: group.oc ? "OpenCode sessions (Windows side)" : group.agy ? "Google Antigravity conversations" : group.cwd, "aria-expanded": String(!collapsed) },
 			h("span", { class: "chev", html: icon(collapsed ? "chevronRight" : "chevronDown") }),
 			group.agy ? h("span", { class: "agy-mark" }, "A") : null,
+			group.oc ? h("span", { class: "oc-mark" }, "OC") : null,
 			h("span", { class: "group-name" }, group.label),
 			h("span", { class: "group-count" }, String(group.items.length)),
 		);
@@ -717,14 +758,23 @@ function sessionRow(s, children, inPinBlock = false) {
 	if (S.attention.has(s.id)) badge = h("span", { class: "badge attention", title: "pi is waiting for your answer" });
 	else if (running && proc.busy) badge = h("span", { class: "badge busy", title: "pi is working" });
 	else if (running) badge = h("span", { class: "badge running", title: "pi is running (web)" });
+	else if (isOc(s) && s.running) badge = h("span", { class: "badge busy", title: "OpenCode is working on this" });
 	else if (isAgy(s) && s.running) badge = h("span", { class: "badge busy", title: "Antigravity is working on this" });
 	else if (isExternallyActive(s)) badge = h("span", { class: "badge external", title: "Recently active (probably in your terminal)" });
 
 	const when = fmtRelative(activity(s));
 	const sub = [
-		isAgy(s) ? (s.stepCount ? `${s.stepCount} steps` : null) : s.userCount ? `${s.userCount} msg` : null,
-		!isAgy(s) && s.tokens ? `${fmtTokens(s.tokens)} tok` : null,
-		isAgy(s) ? null : shortModel(s.lastModel),
+		isOc(s)
+			? [s.agent || "OpenCode", s.lastModel ? shortModel(s.lastModel) : null].filter(Boolean).join(" · ")
+			: isAgy(s)
+				? s.stepCount
+					? `${s.stepCount} steps`
+					: null
+				: s.userCount
+					? `${s.userCount} msg`
+					: null,
+		(s.kind !== "antigravity" || isOc(s)) && s.tokens ? `${fmtTokens(s.tokens)} tok` : null,
+		!isAgy(s) && !isOc(s) ? shortModel(s.lastModel) : null,
 	]
 		.filter(Boolean)
 		.join(" · ");
@@ -821,7 +871,20 @@ function renderTopbar() {
 	bar.replaceChildren(h("div", { class: "top-title" }, titleEl, h("div", { class: "top-sub" }, subBits, statusText ? h("span", { class: "sub-status" }, statusText) : null)));
 
 	const side = [];
-	if (isAgy(meta)) {
+	if (isOc(meta)) {
+		side.push(
+			h(
+				"span",
+				{
+					class: `proc-pill ${meta.running ? "busy" : "running"}`,
+					title: meta.running ? "OpenCode is working on this session" : "OpenCode's background service is up; send a message to run it",
+				},
+				h("span", { class: "dot" }),
+				meta.running ? "OpenCode · working" : "OpenCode · ready",
+			),
+		);
+		side.push(modelButton("oc"));
+	} else if (isAgy(meta)) {
 		side.push(
 			h(
 				"span",
@@ -868,19 +931,101 @@ function processPill() {
 	return h("span", { class: `proc-pill ${cls}`, title: tip }, h("span", { class: "dot" }), label);
 }
 
-function modelButton() {
+function modelButton(kind) {
 	const model = S.proc?.model ? `${S.proc.model.provider}/${S.proc.model.id}` : S.meta?.lastModel;
 	const thinking = S.proc?.thinkingLevel;
 	const btn = h(
 		"button",
-		{ class: "model-btn", type: "button", title: "Model and thinking level" },
+			{ class: "model-btn", type: "button", title: "Model and thinking level" },
 		h("span", { html: icon("cpu") }),
 		h("span", { class: "model-name" }, shortModel(model) || "model"),
 		thinking && thinking !== "off" ? h("span", { class: "model-think" }, thinking) : null,
 		h("span", { html: icon("chevronDown") }),
 	);
-	btn.onclick = () => openModelPicker(btn);
+	btn.onclick = () => (kind === "oc" ? openOcModelPicker(btn) : openModelPicker(btn));
 	return btn;
+}
+
+/** OpenCode's model + agent picker (its own list, its own switch endpoints). */
+async function openOcModelPicker(anchor) {
+	if (!S.current) return;
+	const box = h("div", { class: "model-picker" }, h("div", { class: "picker-loading" }, h("span", { class: "spinner" }), "Loading OpenCode's models…"));
+	openPopover(anchor, box, "model-pop");
+	const [models, agents] = await Promise.allSettled([getJson("/api/oc/models"), getJson("/api/oc/agents")]);
+	if (!popover?.contains(box)) return;
+	if (models.status === "rejected") {
+		box.replaceChildren(h("div", { class: "picker-error" }, models.reason.message));
+		return;
+	}
+	const currentModel = S.meta?.lastModel;
+	const currentAgent = S.meta?.agent;
+	const search = h("input", { type: "search", class: "picker-search", placeholder: "Filter models…" });
+	const list = h("div", { class: "picker-list" });
+	const paint = () => {
+		const q = search.value.trim().toLowerCase();
+		const byProvider = new Map();
+		for (const m of models.value?.models || []) {
+			if (q && !`${m.provider}/${m.id} ${m.name || ""}`.toLowerCase().includes(q)) continue;
+			if (!byProvider.has(m.provider)) byProvider.set(m.provider, []);
+			byProvider.get(m.provider).push(m);
+		}
+		const frag = document.createDocumentFragment();
+		for (const [provider, items] of byProvider) {
+			frag.append(h("div", { class: "picker-group" }, provider));
+			for (const m of items) {
+				const on = currentModel && currentModel === `${m.provider}/${m.id}`;
+				const btn = h(
+					"button",
+					{ class: `picker-item${on ? " on" : ""}`, type: "button" },
+					h("span", { class: "pi-name" }, m.name || m.id),
+					h("span", { class: "pi-id" }, m.id),
+					m.reasoning ? h("span", { class: "pi-tag" }, "thinking") : null,
+				);
+				btn.onclick = async () => {
+					try {
+						await post("/api/oc/model", { session: S.current, model: `${m.provider}/${m.id}` });
+						toast(`Model: ${m.name || m.id}`, "info");
+						} catch (err) {
+						toast(err.message, "error");
+					}
+				};
+				frag.append(btn);
+			}
+		}
+		if (!frag.childNodes.length) frag.append(h("div", { class: "picker-empty" }, "No models match."));
+		list.replaceChildren(frag);
+	};
+	search.addEventListener("input", paint);
+	const agentRow =
+		agents.status === "fulfilled" && (agents.value?.agents || []).length
+			? h(
+					"div",
+					{ class: "picker-thinking" },
+					h("span", { class: "seg-label" }, "Agent"),
+				h(
+						"div",
+						{ class: "seg wrap" },
+						(agents.value?.agents || []).map((a) =>
+							h("button", { type: "button", class: currentAgent === a.id ? "on" : "", title: a.description || "" }, a.name || a.id),
+						),
+					),
+			)
+			: null;
+	if (agentRow)
+		for (const btn of agentRow.querySelectorAll("button"))
+		btn.onclick = async () => {
+			const agent = (agents.value?.agents || []).find((a) => (a.name || a.id) === btn.textContent);
+			if (!agent) return;
+			try {
+				await post("/api/oc/model", { session: S.current, agent: agent.id });
+				toast(`Agent: ${agent.name || agent.id}`, "info");
+			} catch (err) {
+				toast(err.message, "error");
+			}
+		};
+	box.replaceChildren(agentRow || "", search, list);
+	paint();
+	search.focus();
 }
 
 async function renameSession() {
@@ -1045,10 +1190,14 @@ function openSessionMenu(s, x, y) {
 		);
 	const items = [entry("Open", "external", () => navigate(s.id))];
 	items.push(entry(pinnedIds().has(s.id) ? "Unpin" : "Pin", "pin", () => togglePinned(s)));
-	if (!isAgy(s) && s.file) items.push(entry("Copy file path", "copy", () => copy(s.file)));
+	if (!isAgy(s) && !isOc(s) && s.file) items.push(entry("Copy file path", "copy", () => copy(s.file)));
+	if (isOc(s)) items.push(entry("Copy session id", "copy", () => copy(s.ocId || s.id)));
 	items.push(entry(s.archived ? "Unarchive" : "Archive", "archive", () => archiveSession(s, !s.archived)));
 	if (isAgy(s)) {
 		items.push(h("div", { class: "menu-note" }, "Deleting an Antigravity conversation happens in the Antigravity app."));
+	} else if (isOc(s)) {
+		items.push(entry("Delete…", "trash", () => confirmDeleteSession(s), true));
+		items.push(h("div", { class: "menu-note" }, "Deleting here removes it from OpenCode's storage too."));
 	} else {
 		items.push(entry("Delete…", "trash", () => confirmDeleteSession(s), true));
 	}
@@ -1096,7 +1245,15 @@ function openMenu(anchor) {
 			),
 		);
 	const running = hasProcess();
-	const piItems = isAgy(S.meta)
+	const ocItems = isOc(S.meta)
+		? [
+				item("Rename…", "note", renameSession),
+				item("Session info", "note", sessionInfo),
+				h("div", { class: "menu-note" }, `OpenCode ${S.server?.ocVersion || ""} · managed by its own background service`),
+				h("div", { class: "menu-sep" }),
+			]
+		: [];
+	const piItems = isAgy(S.meta) || isOc(S.meta)
 		? []
 		: [
 				running ? item("Stop pi for this session", "power", stopProcess) : item("Start pi for this session", "power", startProcess),
@@ -1112,6 +1269,7 @@ function openMenu(anchor) {
 	const content = h(
 		"div",
 		{ class: "menu" },
+		ocItems,
 		piItems,
 		seg("Tool calls", "tools", [
 			["hidden", "Hide"],
@@ -1303,6 +1461,22 @@ async function exportHtml() {
 
 async function sessionInfo() {
 	const meta = S.meta || {};
+	if (isOc(meta)) {
+		const rows = [
+			["Session id", meta.ocId || meta.id],
+			["Folder", meta.dirWindows || meta.cwd],
+			["Created", meta.created ? new Date(meta.created).toLocaleString() : ""],
+			["Model", meta.lastModel],
+			["Agent", meta.agent],
+			["Tokens", meta.tokens ? `${fmtTokens(meta.tokens)} (input + output + cache)` : ""],
+		].filter(([, v]) => v);
+		modal(
+				"OpenCode session",
+			h("dl", { class: "info-list" }, rows.map(([k, v]) => [h("dt", {}, k), h("dd", { dir: "auto" }, String(v))])),
+			[{ label: "Close", primary: true }],
+		);
+		return;
+	}
 	let stats = S.proc?.stats;
 	if (hasProcess()) stats = await rpc(S.current, { type: "get_session_stats" }).catch(() => stats);
 	const rows = [
@@ -1575,9 +1749,180 @@ function closeTerminal() {
 	term = null;
 }
 
+// ── OpenCode dialogs: forms an agent opens, and permission asks ──────────
+// OpenCode agents can open structured forms (fields with types and options)
+// and request permission for tools the ruleset says to ask about. Both show
+// as modals here; answers go back through pi-web's /api/oc/* routes.
+
+const ocForms = new Map(); // formID -> backdrop
+const ocPerms = new Map(); // requestID -> backdrop
+
+/** Fields an OpenCode form can have → an input element (value read back by key). */
+function ocFieldInput(field, values) {
+	const key = field.key;
+	const label = h("label", { class: "field-wrap" }, h("span", { class: "field-label" }, field.title || key), field.description ? h("span", { class: "field-desc" }, field.description) : null);
+	let input;
+	switch (field.type) {
+		case "boolean": {
+			input = h("input", { type: "checkbox" });
+			input.checked = field.default === true;
+			break;
+		}
+		case "multiselect": {
+			const wrapEl = h("div", { class: "dialog-options" });
+			const picked = new Set();
+			for (const opt of field.options || []) {
+				const b = h("button", { class: "dialog-option", type: "button", dir: "auto" }, stripAnsi(opt.label));
+				b.onclick = () => {
+					if (picked.has(opt.value)) {
+						picked.delete(opt.value);
+					b.classList.remove("on");
+				} else {
+						picked.add(opt.value);
+					b.classList.add("on");
+				}
+				};
+				wrapEl.append(b);
+			}
+			label.append(wrapEl);
+			return { el: label, read: () => ({ [key]: [...picked] }) };
+		}
+		case "number":
+		case "integer":
+			input = h("input", { class: "field", type: "number", dir: "ltr" });
+			break;
+		case "string":
+		default:
+			input = h("input", { class: "field", type: "text", dir: "auto" });
+			if (field.format === "date-time") input.type = "datetime-local";
+			else if (field.format === "date") input.type = "date";
+			else if (field.format === "uri" || field.format === "email") input.type = "text";
+			break;
+	}
+	label.append(input);
+	return { el: label, read: () => ({ [key]: field.type === "boolean" ? input.checked : field.type === "number" || field.type === "integer" ? Number(input.value) : input.value }) };
+}
+
+function openOcForm(form) {
+	closeOcForm(form.id);
+	const fields = [];
+	for (const f of form.fields || []) {
+		if (f.hidden) continue;
+		const field = ocFieldInput(f);
+		fields.push({ key: f.key, required: f.required, el: field.el, read: field.read });
+	}
+	const answer = () => Object.assign({}, ...fields.map((f) => f.read()));
+	const send = async (cancelled) => {
+		const done = (backdrop) => {
+			backdrop.remove();
+			ocForms.delete(form.id);
+		};
+		const backdrop = ocForms.get(form.id);
+		if (cancelled) {
+			post("/api/oc/form", { session: OC_SESS(form.sessionID), form: form.id, cancelled: true }).catch((err) => toast(err.message, "error"));
+			done(backdrop);
+			return;
+		}
+		const missing = fields.filter((f) => f.required && !String(answer()[f.key] ?? "").trim());
+		if (missing.length) {
+			toast(`“${missing[0].key}” is required.`, "warn");
+			return;
+		}
+		post("/api/oc/form", { session: OC_SESS(form.sessionID), form: form.id, answer: answer() }).catch((err) => toast(err.message, "error"));
+		done(backdrop);
+	};
+	const backdrop = h(
+		"div",
+		{ class: "modal-backdrop" },
+		h(
+			"div",
+			{ class: "modal dialog", role: "dialog", "aria-modal": "true" },
+			h("div", { class: "modal-title" }, h("span", { html: icon("help") }), "OpenCode is asking"),
+			h("div", { class: "dialog-body" }, renderInto(h("div", { class: "md dialog-title" }), form.title || "", { sessionId: OC_SESS(form.sessionID) }), ...fields.map((f) => f.el)),
+			h(
+				"div",
+				{ class: "modal-actions" },
+				h("button", { class: "btn ghost", type: "button", onclick: () => send(true) }, "Cancel"),
+				h("button", { class: "btn primary", type: "button", onclick: () => send(false) }, "Send answer"),
+			),
+		),
+	);
+	backdrop.addEventListener("keydown", (e) => {
+		if (e.key === "Escape") {
+			e.stopPropagation();
+			send(true);
+		}
+	});
+	$("#modal-root").append(backdrop);
+	ocForms.set(form.id, backdrop);
+	setTimeout(() => (backdrop.querySelector("input, .btn.primary") || backdrop).focus(), 30);
+	document.title = pageTitle();
+}
+
+function closeOcForm(formId) {
+	const el = ocForms.get(formId);
+	if (el) {
+		el.remove();
+		ocForms.delete(formId);
+		document.title = pageTitle();
+	}
+}
+
+function openOcPermission(request) {
+	closeOcPermission(request.id);
+	const session = OC_SESS(request.sessionID);
+	const reply = (decision) => {
+		post("/api/oc/permission", { session, request: request.id, decision }).catch((err) => toast(err.message, "error"));
+		closeOcPermission(request.id);
+	};
+	const body = h("div", { class: "dialog-body" });
+	body.append(renderInto(h("div", { class: "md dialog-title" }), request.message || `Allow “${request.action}”?`, { sessionId: session }));
+	const res = (request.resources || []).filter(Boolean);
+	if (res.length) body.append(h("pre", { class: "tool-output", dir: "ltr" }, res.join("\n")));
+	const backdrop = h(
+		"div",
+		{ class: "modal-backdrop" },
+		h(
+			"div",
+			{ class: "modal dialog", role: "dialog", "aria-modal": "true" },
+			h("div", { class: "modal-title" }, h("span", { html: icon("shield") }), "OpenCode permission"),
+			body,
+			h(
+				"div",
+				{ class: "modal-actions" },
+				h("button", { class: "btn ghost", type: "button", onclick: () => reply("reject") }, "Deny"),
+				h("button", { class: "btn ghost", type: "button", onclick: () => reply("once") }, "Allow once"),
+			h("button", { class: "btn primary", type: "button", onclick: () => reply("always") }, "Always allow"),
+			),
+		),
+	);
+	backdrop.addEventListener("keydown", (e) => {
+		if (e.key === "Escape") {
+			e.stopPropagation();
+			reply("reject");
+		}
+	});
+	$("#modal-root").append(backdrop);
+	ocPerms.set(request.id, backdrop);
+	setTimeout(() => (backdrop.querySelector(".btn.primary") || backdrop).focus(), 30);
+	document.title = pageTitle();
+}
+
+function closeOcPermission(requestId) {
+	const el = ocPerms.get(requestId);
+	if (el) {
+		el.remove();
+		ocPerms.delete(requestId);
+		document.title = pageTitle();
+	}
+}
+
+/** An OpenCode session id ("ses_…") as pi-web's routed id ("oc-ses_…"). */
+const OC_SESS = (ocId) => `oc-${ocId}`;
+
 // ── new chat ────────────────────────────────────────────────────────────────
 
-async function newChat(initialDir, startKind = isAgy(S.meta) ? "antigravity" : "pi") {
+async function newChat(initialDir, startKind = isOc(S.meta) ? "opencode" : isAgy(S.meta) ? "antigravity" : "pi") {
 	const projects = [...new Set([...S.sessions.values()].sort((a, b) => activity(b) - activity(a)).map((s) => s.cwd).filter(Boolean))];
 	const field = h("input", { class: "field", type: "text", dir: "ltr", spellcheck: "false" });
 	field.value = initialDir || S.meta?.cwd || projects[0] || S.home;
@@ -1632,7 +1977,7 @@ async function newChat(initialDir, startKind = isAgy(S.meta) ? "antigravity" : "
 	});
 
 	// Antigravity: a new conversation starts with its first message.
-	let kind = startKind === "antigravity" && S.server.antigravity ? "antigravity" : "pi";
+	let kind = startKind === "antigravity" && S.server.antigravity ? "antigravity" : startKind === "opencode" && S.server.opencode ? "opencode" : "pi";
 	const agyModel = h(
 		"select",
 		{ class: "field" },
@@ -1663,11 +2008,53 @@ async function newChat(initialDir, startKind = isAgy(S.meta) ? "antigravity" : "
 		h("label", { class: "field-wrap" }, h("span", { class: "field-label" }, "Project folder — the conversation works in this folder"), agyDirField),
 		projects.length ? h("div", { class: "recent-dirs" }, projects.slice(0, 6).map((p) => h("button", { class: "chip", type: "button", title: p, onclick: () => (agyDirField.value = p) }, prettyPath(p, S.home)))) : null,
 	);
-	const kindSeg = S.server.antigravity
+	// OpenCode: a new session starts with its first message; it runs in OpenCode's
+	// own background service (the one the Windows CLI uses), on the Windows side.
+	const ocPrompt = h("textarea", { class: "field", rows: "5", dir: "auto", placeholder: "What should OpenCode do?" });
+	const ocModel = h("select", { class: "field" }, h("option", { value: "" }, "Default model"));
+	const ocAgent = h("select", { class: "field" }, h("option", { value: "" }, "Default agent"));
+	const ocTitle = h("input", { class: "field", type: "text", dir: "auto", placeholder: "Optional" });
+	const ocDirField = h("input", { class: "field", type: "text", dir: "ltr", spellcheck: "false", placeholder: "C:\\Users\\Hp\\Desktop\\project" });
+	ocDirField.value = isOc(S.meta) ? S.meta?.dirWindows || "" : "";
+	const ocStatus = h("div", { class: "modal-text" }, "OpenCode runs on the Windows side; the session appears in its own group in the sidebar.");
+	const ocPane = h(
+		"div",
+		{ class: "new-pane" },
+		ocStatus,
+		h("label", { class: "field-wrap" }, h("span", { class: "field-label" }, "First message"), ocPrompt),
+		h("div", { class: "field-row" }, h("label", { class: "field-wrap" }, h("span", { class: "field-label" }, "Model"), ocModel), h("label", { class: "field-wrap" }, h("span", { class: "field-label" }, "Agent"), ocAgent), h("label", { class: "field-wrap grow" }, h("span", { class: "field-label" }, "Title"), ocTitle)),
+		h("label", { class: "field-wrap" }, h("span", { class: "field-label" }, "Project folder — a Windows path (blank = OpenCode's default)"), ocDirField),
+	);
+	// Fill model/agent picks from the service (async; empty lists degrade to defaults).
+	void (async () => {
+		try {
+			const { models } = await getJson("/api/oc/models");
+			for (const m of models || []) {
+				const opt = h("option", { value: `${m.provider}/${m.id}` }, m.name || m.id);
+				if (S.meta?.lastModel === `${m.provider}/${m.id}`) opt.selected = true;
+				ocModel.append(opt);
+			}
+		} catch {
+			// keep defaults
+		}
+		try {
+			const { agents } = await getJson("/api/oc/agents");
+			for (const a of agents || []) {
+				const opt = h("option", { value: a.id }, a.name || a.id);
+				if (S.meta?.agent === a.id) opt.selected = true;
+				ocAgent.append(opt);
+			}
+		} catch {
+			// keep defaults
+		}
+	})();
+	const kindSeg = S.server.antigravity || S.server.opencode
 		? h(
 				"div",
 				{ class: "seg kind-seg" },
-				["pi", "antigravity"].map((k) =>
+				[
+					...[["pi", "pi"], ...(S.server.antigravity ? [["antigravity", "Antigravity"]] : []), ...(S.server.opencode ? [["opencode", "OpenCode"]] : [])],
+				].map(([k, label]) =>
 					h(
 						"button",
 						{
@@ -1678,7 +2065,7 @@ async function newChat(initialDir, startKind = isAgy(S.meta) ? "antigravity" : "
 								paintKind();
 							},
 						},
-						k === "pi" ? "pi" : "Antigravity",
+						label,
 					),
 				),
 			)
@@ -1686,11 +2073,13 @@ async function newChat(initialDir, startKind = isAgy(S.meta) ? "antigravity" : "
 	const paintKind = () => {
 		piPane.hidden = kind !== "pi";
 		agyPane.hidden = kind !== "antigravity";
+		ocPane.hidden = kind !== "opencode";
 		for (const b of kindSeg?.children || []) b.classList.toggle("on", b.dataset.kind === kind);
 		if (kind === "antigravity") setTimeout(() => agyPrompt.focus(), 20);
+		if (kind === "opencode") setTimeout(() => ocPrompt.focus(), 20);
 	};
 	paintKind();
-	const body = h("div", { class: "new-chat" }, kindSeg, piPane, agyPane);
+	const body = h("div", { class: "new-chat" }, kindSeg, piPane, agyPane, ocPane);
 
 	const choice = await modal(
 		"New chat",
@@ -1703,7 +2092,9 @@ async function newChat(initialDir, startKind = isAgy(S.meta) ? "antigravity" : "
 				value: () =>
 					kind === "pi"
 						? { kind, cwd: field.value.trim() }
-						: { kind, prompt: agyPrompt.value.trim(), model: agyModel.value, title: agyTitle.value.trim(), cwd: agyDirField.value.trim() },
+						: kind === "antigravity"
+							? { kind, prompt: agyPrompt.value.trim(), model: agyModel.value, title: agyTitle.value.trim(), cwd: agyDirField.value.trim() }
+							: { kind, prompt: ocPrompt.value.trim(), model: ocModel.value || undefined, agent: ocAgent.value || undefined, title: ocTitle.value.trim() || undefined, cwd: ocDirField.value.trim() || undefined },
 			},
 		],
 		{ cls: "wide" },
@@ -1713,7 +2104,11 @@ async function newChat(initialDir, startKind = isAgy(S.meta) ? "antigravity" : "
 		toast("Write the first message for Antigravity.", "warn");
 		return newChat(initialDir, "antigravity");
 	}
-	const t = toast(choice.kind === "pi" ? "Starting pi…" : "Starting an Antigravity conversation…", "info");
+	if (choice.kind === "opencode" && !choice.prompt) {
+		toast("Write the first message for OpenCode.", "warn");
+		return newChat(initialDir, "opencode");
+	}
+	const t = toast(choice.kind === "pi" ? "Starting pi…" : choice.kind === "antigravity" ? "Starting an Antigravity conversation…" : "Starting an OpenCode session…", "info");
 	try {
 		const res = await post("/api/new", choice);
 		t.remove();
@@ -1953,6 +2348,24 @@ function renderStatus() {
 		el.replaceChildren();
 		return;
 	}
+	if (isOc(S.meta)) {
+		// OpenCode: no context-window readout (its API reports totals only).
+		const parts = [];
+		if (S.meta?.tokens) {
+			parts.push(
+				h(
+					"span",
+					{ class: "meter-chat-tokens", title: `Everything this OpenCode session has used: ${Number(S.meta.tokens).toLocaleString()} tokens (input + output + cache)` },
+					h("span", { html: icon("zap") }),
+					h("b", {}, fmtTokens(S.meta.tokens)),
+					" this session",
+				),
+			);
+		}
+		if (S.meta?.running) parts.push(h("span", { class: "meter-note" }, "OpenCode is working…"));
+		el.replaceChildren(...parts);
+		return;
+	}
 	if (isAgy(S.meta)) {
 		el.replaceChildren(...agyMeters());
 		return;
@@ -2143,7 +2556,14 @@ function updateComposer() {
 						: "Enter send (starts pi) · Shift+Enter new line · / commands";
 	$("#composer-hint").textContent = hint;
 	input.placeholder = S.current ? (busy ? "Steer pi while it works…" : "Message pi…") : "";
-	if (isAgy(S.meta)) {
+	if (isOc(S.meta)) {
+		// OpenCode: the session runs in its background service; a message runs it.
+		$("#btn-stop").hidden = !S.meta.running;
+		$("#composer").classList.toggle("busy", !!S.meta.running);
+		$("#btn-send").title = "Send to OpenCode (Enter)";
+		input.placeholder = "Message OpenCode…";
+		$("#composer-hint").textContent = S.meta.running ? "OpenCode is working; your message joins the queue (Enter) · Esc interrupts" : "Enter sends into this OpenCode session · Esc interrupts a run";
+	} else if (isAgy(S.meta)) {
 		// Antigravity: messages go into the conversation through the app; it can't be stopped from here.
 		$("#btn-stop").hidden = true;
 		$("#composer").classList.toggle("busy", !!S.meta.running);
@@ -2212,9 +2632,9 @@ const fetchSearchHits = debounce(async () => {
 
 let warmed = null;
 function prewarm() {
-	if (!S.current || isAgy(S.meta) || hasProcess() || warmed === S.current || isExternallyActive(S.meta) || !S.server.piBin) return;
+	if (!S.current || isAgy(S.meta) || isOc(S.meta) || hasProcess() || warmed === S.current || isExternallyActive(S.meta) || !S.server.piBin) return;
 	warmed = S.current;
-	post("/api/process", { session: S.current, action: "start" }).catch(() => {});
+	post("/api/process", { session: S.current, action: "start", prewarm: true }).catch(() => {});
 }
 
 async function loadCommands() {
@@ -2244,6 +2664,14 @@ function slashCandidates(prefix) {
 
 const slash = { open: false, items: [], index: 0 };
 
+/** Commands that make sense for an OpenCode session (no pi process behind it). */
+const OC_COMMANDS = [
+	{ name: "name", description: "Rename this session: /name My topic" },
+	{ name: "new", description: "Start a new chat" },
+	{ name: "resume", description: "Find another session" },
+	{ name: "session", description: "Session id and usage" },
+];
+
 function updateSlashMenu() {
 	const input = $("#input");
 	const menu = $("#slash-menu");
@@ -2251,6 +2679,34 @@ function updateSlashMenu() {
 	if (!m || !S.current || isAgy(S.meta)) {
 		slash.open = false;
 		menu.hidden = true;
+		return;
+	}
+	if (isOc(S.meta)) {
+		// OpenCode: a small fixed set (rename/new/resume/session); pi's commands
+		// (compact, thinking, shell…) don't apply — there is no pi behind it.
+		const q0 = m[1].toLowerCase();
+		slash.items = OC_COMMANDS.filter((c) => c.name.includes(q0));
+		slash.index = Math.min(slash.index, Math.max(0, slash.items.length - 1));
+		slash.open = slash.items.length > 0;
+		menu.hidden = !slash.open;
+		menu.replaceChildren(
+			...slash.items.map((c, i) =>
+				h(
+					"button",
+					{
+						class: `slash-item${i === slash.index ? " on" : ""}`,
+						type: "button",
+						onmousedown: (e) => {
+							e.preventDefault();
+							pickSlash(i);
+						},
+					},
+					h("span", { class: "slash-name" }, `/${c.name}`),
+					h("span", { class: "slash-desc", dir: "auto" }, c.description || ""),
+					h("span", { class: "slash-src" }, "opencode"),
+				),
+			),
+		);
 		return;
 	}
 	if (hasProcess() && !S.commands) loadCommands().then(() => slash.open && updateSlashMenu());
@@ -2325,6 +2781,10 @@ async function builtinCommand(text) {
 	const arg = (argRaw || "").trim();
 	switch (name) {
 		case "model": {
+			if (isOc(S.meta)) {
+				openOcModelPicker($(".model-btn") || $("#topbar-side"));
+				return true;
+			}
 			if (arg.includes("/")) {
 				const [provider, ...rest] = arg.split("/");
 				await rpc(S.current, { type: "set_model", provider, modelId: rest.join("/") }).then(
@@ -2416,12 +2876,47 @@ async function submitAntigravity(text, images) {
 	}
 }
 
+async function submitOpenCode(text, images) {
+	if (images.length) {
+		toast("Images can't be sent to OpenCode from here yet.", "warn");
+		return;
+	}
+	const input = $("#input");
+	input.value = "";
+	autoGrow();
+	saveDraft();
+	S.sending = true;
+	updateComposer();
+	conv.stick = true;
+	try {
+		await post("/api/prompt", { session: S.current, message: text, behavior: "steer" });
+	} catch (err) {
+		toast(err.message, "error");
+		if (!input.value.trim()) setComposerText(text);
+	} finally {
+		S.sending = false;
+		updateComposer();
+	}
+}
+
 async function submit({ followUp = false } = {}) {
 	const input = $("#input");
 	const text = input.value;
 	const images = S.attachments.slice();
 	if (!S.current || (!text.trim() && !images.length) || S.sending) return;
 	const trimmed = text.trim();
+	if (isOc(S.meta)) {
+		if (trimmed.startsWith("/")) {
+			const handled = await builtinCommand(trimmed);
+			if (handled) {
+				input.value = "";
+				autoGrow();
+				saveDraft();
+				return;
+			}
+		}
+		return submitOpenCode(text, images);
+	}
 	if (isAgy(S.meta)) return submitAntigravity(text, images);
 	if (!images.length && trimmed.startsWith("/")) {
 		const handled = await builtinCommand(trimmed);
@@ -2527,6 +3022,10 @@ function addImageFiles(files) {
 async function addFiles(files) {
 	if (!S.current) {
 		toast("Open a session first — uploads go into its folder.", "warn");
+		return;
+	}
+	if (isOc(S.meta)) {
+		toast("Files can be attached to pi sessions; OpenCode reads folders on the Windows side itself.", "warn");
 		return;
 	}
 	if (isAgy(S.meta)) {

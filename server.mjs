@@ -12,6 +12,7 @@ import { AGY_PREFIX, AgyTail, AntigravityIndex, findAntigravityDir, readArtifact
 import { AntigravityLive, antigravityAppExe } from "./lib/antigravity-live.mjs";
 import { Bridge } from "./lib/bridge.mjs";
 import { loadConfig } from "./lib/config.mjs";
+import { OC_PREFIX, OpenCode, findOpenCodeBin, findOpenCodeHome, isOcId } from "./lib/opencode.mjs";
 import { readImage as claudeReadImage, visionStatus } from "./lib/vision.mjs";
 import { ModelCatalog } from "./lib/models.mjs";
 import { PiProcess } from "./lib/pi-process.mjs";
@@ -156,6 +157,11 @@ const agyDir = process.env.PI_WEB_NO_ANTIGRAVITY === "1" ? undefined : findAntig
 const agy = agyDir ? new AntigravityIndex(agyDir) : null;
 const agyLive = agy ? new AntigravityLive({ index: agy }) : null;
 const agyApp = agyDir ? antigravityAppExe(agyDir) : null;
+// OpenCode: another coding agent, running on the Windows side with an HTTP
+// API. Talked to through its background service; sessions appear in the
+// sidebar and chat like pi's (see lib/opencode.mjs for the how).
+const ocBin = process.env.PI_WEB_NO_OPENCODE === "1" ? null : findOpenCodeBin();
+const oc = ocBin ? new OpenCode({ bin: ocBin, home: findOpenCodeHome() }) : null;
 const clients = new Set();
 
 /** Wait until the Antigravity index lists a conversation (new ones take a moment to be saved). */
@@ -273,6 +279,7 @@ async function searchSessions(q) {
 }
 
 const isAgy = (id) => typeof id === "string" && id.startsWith(AGY_PREFIX);
+const isOc = (id) => isOcId(id);
 
 // ── your activity: tokens, messages, active days across all chats ──────────
 // Computed from the session files themselves (so it covers every chat ever,
@@ -494,8 +501,9 @@ async function findOrCreateAgyProject(cwd) {
 	return { projectId: id, name, created: true };
 }
 
-/** Session metadata for a pi session or an Antigravity conversation. */
+/** Session metadata for a pi session, an Antigravity conversation or an OpenCode session. */
 function metaFor(id) {
+	if (isOc(id)) return oc?.get(id);
 	if (isAgy(id)) return agy?.get(id);
 	return index.get(id);
 }
@@ -517,29 +525,36 @@ function procInfo(p) {
 }
 
 function decorated(meta) {
-	const m = meta.kind === "antigravity" ? meta : index.decorate(meta);
+	const m = meta.kind === "antigravity" || meta.kind === "opencode" ? meta : index.decorate(meta);
 	m.archived = archived.has(m.id);
 	// Live usage for the sidebar: this chat's tokens (cached; the scan is one
 	// pass, re-run only when the file changed).
-	if (m.kind !== "antigravity" && m.file) {
+	if (m.kind !== "antigravity" && m.kind !== "opencode" && m.file) {
 		const t = sessionTokens(m.file);
 		m.tokens = t.tokens;
 		m.reasoning = t.reasoning;
 		m.tokenMessages = t.messages;
 	}
+	// The exact "live in terminal" flag: a terminal pi holds this file. The
+	// browser prefers it over its mtime heuristic (which false-positives on
+	// a web pi that died with a restart).
+	if (m.kind !== "antigravity" && m.kind !== "opencode") m.terminalPi = !!terminalPiFor(m.file);
 	return m;
 }
 
 function allSessions() {
-	const out = agy ? [...index.list(), ...agy.list()] : index.list();
+	const out = index.list();
+	if (agy) out.push(...agy.list());
+	if (oc) out.push(...oc.list());
 	for (const s of out) {
 		s.archived = archived.has(s.id);
-		if (s.kind !== "antigravity" && s.file && s.tokens == null) {
+		if (s.kind !== "antigravity" && s.kind !== "opencode" && s.file && s.tokens == null) {
 			const t = sessionTokens(s.file);
 			s.tokens = t.tokens;
 			s.reasoning = t.reasoning;
 			s.tokenMessages = t.messages;
 		}
+		if (s.kind !== "antigravity" && s.kind !== "opencode" && s.file) s.terminalPi = !!terminalPiFor(s.file);
 	}
 	return out;
 }
@@ -667,6 +682,18 @@ function onTailReset(file) {
 function snapshot(sessionId) {
 	const meta = metaFor(sessionId);
 	if (!meta) return null;
+	if (isOc(sessionId)) {
+		// Entries come from the OpenCode API (async); the stream handler ships
+		// them right after this snapshot as an "entries" event.
+		return {
+			meta: decorated(meta),
+			header: null,
+			entries: [],
+			links: {},
+			proc: null,
+			live: oc?.liveState(sessionId),
+		};
+	}
 	const t = meta.file ? tails.get(meta.file)?.tail : undefined;
 	const entries = t ? t.entries : [];
 	const proc = procs.get(sessionId);
@@ -808,11 +835,20 @@ function writeWatched() {
 async function restoreWatched() {
 	if (!config.piBin) return;
 	const entries = [...watched.values()]
-		.filter((s) => s.id && !isAgy(s.id))
+		.filter((s) => s.id && !isAgy(s.id) && !isOc(s.id))
 		.map((s) => ({ ...s, mtime: index.get(s.id)?.mtime || 0 }))
 		.sort((a, b) => b.mtime - a.mtime)
 		.slice(0, 3);
 	for (const s of entries) {
+		// Never restore onto a session a terminal pi is writing right now:
+		// that web pi would fork it and mask the "live in terminal" state.
+		const meta = index.get(s.id);
+		if (externallyDriven(meta)) {
+			console.log(`[pi-web] restore skipped for ${s.id}: live in a terminal — read-only here`);
+			watched.delete(s.id);
+			writeWatched();
+			continue;
+		}
 		try {
 			await ensureProc(s.id);
 			console.log(`[pi-web] restored pi for ${s.id}`);
@@ -826,7 +862,52 @@ async function restoreWatched() {
 }
 let watched = readWatched();
 
-async function ensureProc(sessionId) {
+// ── which sessions a terminal pi is driving ────────────────────────────
+// A web pi that died with a restart also wrote the file moments ago, so a
+// recent mtime cannot mean "someone else owns this" — that false "live in
+// terminal" (plus the send-warning) is exactly what breaks the seamless
+// reconnect after a restart. The exact signal: a live pi process holding
+// `--session <file>` that is not one of this server's children.
+let piScan = { at: 0, byFile: new Map() };
+
+/** Live `--session <file>` → pid, for pis that are NOT our children. */
+function terminalPiFiles() {
+	if (Date.now() - piScan.at < 2000) return piScan.byFile;
+	const byFile = new Map();
+	const ours = new Set([process.pid]);
+	for (const p of allProcs) if (p.pid) ours.add(p.pid);
+	for (const p of procs.values()) if (p.pid) ours.add(p.pid);
+	try {
+		for (const pidStr of fs.readdirSync("/proc")) {
+			const pid = Number(pidStr);
+			if (!pid || ours.has(pid)) continue;
+		let args;
+			try {
+				args = fs.readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0");
+			} catch {
+				continue;
+			}
+			const i = args.indexOf("--session");
+			if (i >= 0 && args[i + 1]) byFile.set(args[i + 1], pid);
+		}
+	} catch {
+		// /proc unreadable (not Linux): no terminal pis detectable
+	}
+	piScan = { at: Date.now(), byFile };
+	return byFile;
+}
+
+/** The terminal pi driving this session file (its pid), or undefined. */
+function terminalPiFor(file) {
+	return file ? terminalPiFiles().get(file) : undefined;
+}
+
+/** Is this session currently held by a pi that is not ours? */
+function externallyDriven(meta) {
+	return !!terminalPiFor(meta?.file);
+}
+
+async function ensureProc(sessionId, { allowExternal = false } = {}) {
 	let p = procs.get(sessionId);
 	if (p?.adopted) {
 		// A pi that outlived a crash: fine for answering its open quizzes, but
@@ -843,6 +924,11 @@ async function ensureProc(sessionId) {
 	const meta = index.get(sessionId);
 	if (!meta) throw new HttpError(404, "Unknown session");
 	if (meta.pending) throw new HttpError(409, "pi never saved this session. Start a new chat instead.");
+	// Another pi (your terminal) is writing this file right now: a web pi here
+	// would fork the conversation and mask the "live in terminal" state.
+	// Deliberate take-overs (a confirmed send, the menu's Start) pass
+	// allowExternal; background spawns (restore, prewarm, pickers) do not.
+	if (!allowExternal && externallyDriven(meta)) throw new HttpError(409, "This session is being written by another pi (your terminal?) — it stays read-only here while it is active.");
 	if (!meta.cwd) throw new HttpError(400, "This session file does not record its working folder.");
 	if (!isDir(meta.cwd)) throw new HttpError(400, `The session's folder no longer exists: ${meta.cwd}`);
 	p = spawnPi({ cwd: meta.cwd, sessionFile: meta.file, expectedId: sessionId });
@@ -996,6 +1082,35 @@ bridge.on("message", (key, msg) => {
 			break;
 	}
 });
+
+// ── OpenCode events → browser ────────────────────────────────────────────
+// The OpenCode service streams everything that happens in its sessions;
+// forward it to the pages watching them (metas to everyone, like pi's).
+if (oc) {
+	oc.on("upsert", (meta) => {
+		meta.archived = archived.has(meta.id);
+		broadcastAll("session_upsert", meta);
+	});
+	oc.on("remove", (ocId) => broadcastAll("session_remove", { id: OC_PREFIX + ocId }));
+	oc.on("entries", ({ ocId, entries }) => broadcastSession(OC_PREFIX + ocId, "entries", { entries, links: {} }));
+	oc.on("rpc", ({ ocId, ev }) => broadcastSession(OC_PREFIX + ocId, "rpc", ev));
+	oc.on("form", ({ form, open }) => {
+		// An agent asking structured questions — the page shows a dialog.
+		const sid = OC_PREFIX + form.sessionID;
+		broadcastSession(sid, "oc_form", { form, open });
+		if (open) broadcastAll("attention", { sessionId: sid, kind: "dialog", title: form.title || "a form" });
+	});
+	oc.on("permission", ({ request, open }) => {
+		// A tool waiting on an allow/deny answer — same dialog treatment.
+		const sid = OC_PREFIX + request.sessionID;
+		broadcastSession(sid, "oc_permission", { request, open });
+		if (open) broadcastAll("attention", { sessionId: sid, kind: "dialog", title: `permission: ${request.action}` });
+	});
+	oc.on("notice", (n) => {
+		if (n.sessionId) broadcastSession(n.sessionId, "notice", n);
+		else broadcastAll("notice", n);
+	});
+}
 
 // ── memory watchdog ─────────────────────────────────────────────────────────
 // This machine runs 6.6 GB WSL with real OOM kills in the log (big python /
@@ -1240,10 +1355,18 @@ function handleStream(req, res, url) {
 		home: os.homedir(),
 		sessionsDir: config.sessionsDir,
 		antigravity: !!agy,
+		opencode: !!oc,
 		sessions: allSessions(),
 		procs: [...procs.values()].map(procSummary),
 		session: sessionId ? snapshot(sessionId) : null,
 	});
+	// OpenCode snapshots carry no entries (they live behind the API): ship them
+	// as the next event, so the page fills the moment they arrive.
+	if (isOc(sessionId) && oc) {
+		oc.entriesFor(sessionId)
+			.then((entries) => sse(client, "entries", { entries, links: {} }))
+			.catch(() => sse(client, "notice", { level: "error", message: "Could not read this OpenCode session." }));
+	}
 	const ping = setInterval(() => res.write(": ping\n\n"), 20_000);
 	req.on("close", () => {
 		clearInterval(ping);
@@ -1283,6 +1406,18 @@ async function handleApiPost(route, body) {
 			const { session, message, images, behavior } = body;
 			const hasImages = Array.isArray(images) && images.length > 0;
 			if (typeof message !== "string" || (!message.trim() && !hasImages)) throw new HttpError(400, "Nothing to send");
+			if (isOc(session)) {
+				if (!oc) throw new HttpError(404, "OpenCode was not found on this machine.");
+				if (hasImages) throw new HttpError(400, "Images can't be sent to OpenCode from here yet.");
+				const meta = oc.get(session);
+				if (!meta) throw new HttpError(404, "Unknown OpenCode session");
+				try {
+					await oc.prompt(meta.ocId, message, { delivery: behavior === "followUp" ? "queue" : "steer" });
+				} catch (err) {
+					throw new HttpError(err.status || 502, err.message);
+				}
+				return { ok: true };
+			}
 			if (isAgy(session)) {
 				const meta = metaFor(session);
 				if (!meta || !agyLive) throw new HttpError(404, "Unknown Antigravity conversation");
@@ -1295,7 +1430,7 @@ async function handleApiPost(route, body) {
 				setTimeout(() => agy.refresh().catch(() => {}), 1500);
 				return { ok: true };
 			}
-			const p = await ensureProc(session);
+			const p = await ensureProc(session, { allowExternal: true }); // the browser warned about the fork if it could tell
 			const command = { type: "prompt", message, streamingBehavior: behavior === "followUp" ? "followUp" : "steer" };
 			if (hasImages) {
 				command.images = images
@@ -1375,12 +1510,29 @@ async function handleApiPost(route, body) {
 		case "/api/command": {
 			const { session, command } = body;
 			if (!command || !PASSTHROUGH.has(command.type)) throw new HttpError(400, "That command is not available here");
+			if (isOc(session)) {
+				if (!oc) throw new HttpError(404, "OpenCode was not found on this machine.");
+				const meta = oc.get(session);
+				if (!meta) throw new HttpError(404, "Unknown session");
+				if (command.type === "abort") {
+					await oc.interrupt(meta.ocId).catch((err) => { throw new HttpError(err.status || 502, err.message); });
+					return { ok: true, data: null };
+				}
+				if (command.type === "set_session_name") {
+					await oc.rename(meta.ocId, String(command.name || "").trim()).catch((err) => { throw new HttpError(err.status || 502, err.message); });
+					return { ok: true, data: null };
+				}
+				if (command.type === "get_state") {
+					return { ok: true, data: { sessionId: session, model: meta.lastModel ? { provider: meta.lastModel.split("/")[0], id: meta.lastModel.split("/").slice(1).join("/") } : undefined, thinkingLevel: null, busy: !!meta.running } };
+				}
+				throw new HttpError(400, `That only works for pi sessions; OpenCode is managed from its own pane here.`);
+			}
 			if (isAgy(session)) {
 				if (NO_SPAWN.has(command.type)) return { ok: true, data: null };
 				throw new HttpError(400, "That only works for pi sessions; manage Antigravity conversations in the Antigravity app.");
 			}
 			if (NO_SPAWN.has(command.type) && !procs.get(session)) return { ok: true, data: null };
-			const p = await ensureProc(session);
+			const p = await ensureProc(session); // pickers/commands never spawn over a terminal-driven session
 			if (command.type === "abort") cancelInteractive(p);
 			const { id: _clientId, ...rest } = command;
 			const data = await p.request(rest);
@@ -1432,6 +1584,21 @@ async function handleApiPost(route, body) {
 		}
 		case "/api/session/delete": {
 			const { session } = body;
+			if (isOc(session)) {
+				if (!oc) throw new HttpError(400, "OpenCode was not found on this machine.");
+				const meta = oc.get(session);
+				if (!meta) throw new HttpError(404, "Unknown session");
+				if (meta.running) throw new HttpError(409, "Stop OpenCode first (it is still working on this session).");
+				try {
+					await oc.remove(meta.ocId);
+				} catch (err) {
+					throw new HttpError(err.status || 502, err.message);
+				}
+				archived.delete(session);
+				writeArchived();
+				broadcastAll("session_remove", { id: session });
+				return { ok: true };
+			}
 			if (isAgy(session)) throw new HttpError(400, "Antigravity conversations live in the Antigravity app — archive it here instead, or delete it there.");
 			const meta = index.get(session);
 			if (!meta) throw new HttpError(404, "Unknown session");
@@ -1455,7 +1622,8 @@ async function handleApiPost(route, body) {
 		}
 		case "/api/process": {
 			const { session, action } = body;
-			if (action === "start") return { ok: true, proc: (await ensureProc(session)).info() };
+			if (isOc(session)) throw new HttpError(400, "OpenCode sessions run in the OpenCode service; there is no separate process to start or stop here.");
+			if (action === "start") return { ok: true, proc: (await ensureProc(session, { allowExternal: !body.prewarm })).info() };
 			if (action === "stop") {
 				const p = procs.get(session);
 				if (p) {
@@ -1468,6 +1636,24 @@ async function handleApiPost(route, body) {
 			throw new HttpError(400, "Unknown action");
 		}
 		case "/api/new": {
+			if (body.kind === "opencode") {
+				if (!oc) throw new HttpError(404, "OpenCode was not found on this machine.");
+				const prompt = String(body.prompt || "").trim();
+				if (!prompt) throw new HttpError(400, "Write the first message for OpenCode.");
+				let session;
+				try {
+					session = await oc.createSession({
+						directory: body.cwd || undefined,
+						agent: body.agent || undefined,
+						model: body.model || undefined,
+						title: body.title || undefined,
+						prompt,
+					});
+				} catch (err) {
+					throw new HttpError(err.status || 502, err.message);
+				}
+				return { ok: true, session };
+			}
 			if (body.kind !== "antigravity") return { ok: true, session: await newSession(body.cwd) };
 			if (!agyLive) throw new HttpError(404, "Antigravity was not found on this machine.");
 			const prompt = String(body.prompt || "").trim();
@@ -1483,6 +1669,36 @@ async function handleApiPost(route, body) {
 			}
 			await awaitAgyConversation(AGY_PREFIX + uuid);
 			return { ok: true, session: AGY_PREFIX + uuid };
+		}
+		case "/api/oc/model": {
+			// Set the model (and agent) for an OpenCode session.
+			if (!oc) throw new HttpError(404, "OpenCode was not found on this machine.");
+			const meta = oc.get(body.session);
+			if (!meta) throw new HttpError(404, "Unknown session");
+			if (body.agent && body.agent !== meta.agent) await oc.api(`/api/session/${meta.ocId}/agent`, { method: "POST", body: { agent: body.agent } }).catch((err) => { throw new HttpError(err.status || 502, err.message); });
+			if (body.model) {
+				const [providerID, ...rest] = String(body.model).split("/");
+				// The switch endpoint takes a Model.Ref: {providerID, id, variant?}.
+				await oc.setModel(meta.ocId, providerID, rest.join("/")).catch((err) => { throw new HttpError(err.status || 502, err.message); });
+			}
+			return { ok: true };
+		}
+		case "/api/oc/form": {
+			if (!oc) throw new HttpError(404, "OpenCode was not found on this machine.");
+			const meta = oc.get(body.session);
+			if (!meta) throw new HttpError(404, "Unknown session");
+			if (body.cancelled) await oc.api(`/api/session/${meta.ocId}/form/${body.form}/cancel`, { method: "DELETE" }).catch((err) => { throw new HttpError(err.status || 502, err.message); });
+			else await oc.replyForm(meta.ocId, body.form, body.answer || {}).catch((err) => { throw new HttpError(err.status || 502, err.message); });
+			return { ok: true };
+		}
+		case "/api/oc/permission": {
+			if (!oc) throw new HttpError(404, "OpenCode was not found on this machine.");
+			const meta = oc.get(body.session);
+			if (!meta) throw new HttpError(404, "Unknown session");
+			const decision = ["once", "always", "reject"].includes(body.decision) ? body.decision : null;
+			if (!decision) throw new HttpError(400, "Decision must be once, always or reject");
+			await oc.replyPermission(meta.ocId, body.request, decision, body.message).catch((err) => { throw new HttpError(err.status || 502, err.message); });
+			return { ok: true };
 		}
 		case "/api/agy/project": {
 			// Open (find-or-create) an Antigravity project for a folder, so its
@@ -1514,7 +1730,7 @@ function listDirs(dir) {
 	};
 }
 
-function handleApiGet(req, res, url) {
+async function handleApiGet(req, res, url) {
 	const route = url.pathname;
 	const session = url.searchParams.get("session");
 	switch (route) {
@@ -1538,6 +1754,27 @@ function handleApiGet(req, res, url) {
 		case "/api/agy/status": {
 			if (!agyLive) return sendJson(res, 200, { installed: false });
 			return agyLive.quota({ force: url.searchParams.get("force") === "1" }).then((q) => sendJson(res, 200, { installed: true, ...q }));
+		}
+		case "/api/oc/status": {
+			if (!oc) return sendJson(res, 200, { installed: false });
+			const info = { installed: true, version: oc.version, connected: !!oc.conn, running: [] };
+			for (const m of oc.list()) if (m.running) info.running.push(m.id);
+			return sendJson(res, 200, info);
+		}
+		case "/api/oc/models": {
+			if (!oc) throw new HttpError(404, "OpenCode was not found on this machine.");
+			const models = await oc.models().catch((err) => { throw new HttpError(err.status || 502, err.message); });
+			return sendJson(res, 200, { models: models.map((m) => ({ provider: m.providerID, id: m.id, name: m.name, reasoning: (m.variants || []).some((v) => /high|reason/i.test(v.id)), contextWindow: m.limit?.context, input: (m.capabilities?.input || []).includes("image") ? "image" : undefined })) });
+		}
+		case "/api/oc/agents": {
+			if (!oc) throw new HttpError(404, "OpenCode was not found on this machine.");
+			const agents = await oc.agents().catch((err) => { throw new HttpError(err.status || 502, err.message); });
+			return sendJson(res, 200, { agents: agents.map((a) => ({ id: a.id, name: a.name, description: a.description, mode: a.mode })) });
+		}
+		case "/api/oc/projects": {
+			if (!oc) throw new HttpError(404, "OpenCode was not found on this machine.");
+			const projects = await oc.projects().catch((err) => { throw new HttpError(err.status || 502, err.message); });
+			return sendJson(res, 200, { projects });
 		}
 		case "/api/vision/status":
 			return sendJson(res, 200, visionStatus());
@@ -1642,7 +1879,12 @@ const server = http.createServer((req, res) => {
 
 // ── startup ─────────────────────────────────────────────────────────────────
 
-index.on("upsert", (meta) => { meta.archived = archived.has(meta.id); broadcastAll("session_upsert", meta); });
+index.on("upsert", (meta) => {
+	meta.archived = archived.has(meta.id);
+	// Ship the exact terminal-pi flag with every meta the browser sees.
+	if (meta.file) meta.terminalPi = !!terminalPiFor(meta.file);
+	broadcastAll("session_upsert", meta);
+});
 index.on("remove", (id) => broadcastAll("session_remove", { id }));
 
 // ── why-did-it-die log ──────────────────────────────────────────────────────
@@ -1682,6 +1924,7 @@ function shutdown() {
 		p.stopRequested = true;
 		p.stop();
 	}
+	oc?.stop();
 	bridge.close();
 	server.close();
 	setTimeout(() => process.exit(0), 1500).unref();
@@ -1697,6 +1940,15 @@ if (agy) {
 	agy.on("upsert", (meta) => { meta.archived = archived.has(meta.id); broadcastAll("session_upsert", meta); });
 	agy.on("remove", (id) => broadcastAll("session_remove", { id }));
 	await agy.start().catch((err) => console.warn(`[pi-web] Antigravity: ${err.message}`));
+}
+
+// OpenCode: connect in the background so the port opens immediately even on
+// a cold start (the first session list follows via upserts a moment later).
+if (oc) {
+	void oc
+		.begin()
+		.then(() => console.log(`[pi-web] OpenCode ${oc.version || ""} connected: ${oc.list().length} sessions`))
+		.catch((err) => console.warn(`[pi-web] OpenCode: ${err.message}`));
 }
 
 try {
@@ -1725,5 +1977,6 @@ server.listen(config.port, config.host, () => {
 	console.log(`  pi        ${config.piBin || "NOT FOUND — reading works, chatting does not"}`);
 	if (config.assetDirs.length) console.log(`  images    ${config.assetDirs.join(", ")}`);
 	if (agy) console.log(`  antigrav. ${agyDir} (${agy.list().length} conversations)`);
+	if (oc) console.log(`  opencode ${ocBin} (service on demand; PI_WEB_NO_OPENCODE=1 hides it)`);
 	if (!process.env.TMUX) console.log("  note      not inside tmux: pi subagents (tmux panes) will not work from the GUI");
 });

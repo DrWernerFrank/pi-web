@@ -274,7 +274,10 @@ export class Conversation {
 	/** The file tail can deliver a message before pi's own event for it; never show it twice. */
 	pruneFinals() {
 		const before = this.live.finals.length;
-		this.live.finals = this.live.finals.filter((m) => !this.savedKeys.has(messageKey(m)));
+		// Entries that carry their source message id (OpenCode conversions) match
+		// live finals by it — timestamps alone can differ between the two.
+		const savedIds = new Set(this.entries.filter((e) => e?.message?.id).map((e) => e.message.id));
+		this.live.finals = this.live.finals.filter((m) => !this.savedKeys.has(messageKey(m)) && !(m.id && savedIds.has(m.id)));
 		return before !== this.live.finals.length;
 	}
 

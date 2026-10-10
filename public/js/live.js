@@ -23,6 +23,9 @@ export function createLive() {
 export function messageKey(m) {
 	if (!m) return "";
 	if (m.role === "custom") return `custom|${m.customType}|${textOf(m.content).slice(0, 300)}`;
+	// An id (OpenCode conversions carry it) matches exactly; pi's messages
+	// (no id) fall back to role+timestamp like before.
+	if (m.id) return `${m.role}|${m.id}`;
 	return `${m.role}|${m.timestamp}`;
 }
 
@@ -215,12 +218,17 @@ export function applyUiRequest(live, req) {
 /** Forget live copies of messages and tool runs once the session file has them. */
 export function dropPersisted(live, entries) {
 	const keys = new Set();
+	const ids = new Set();
 	const results = new Set();
 	for (const e of entries) {
 		const key = entryMessageKey(e);
 		if (key) keys.add(key);
+		// OpenCode conversions carry the source message id on every entry —
+		// exact dedupe even when the live copy's timestamp differs.
+		if (e?.message?.id) ids.add(e.message.id);
 		if (e.type === "message" && e.message?.role === "toolResult") results.add(e.message.toolCallId);
 	}
 	if (keys.size) live.finals = live.finals.filter((m) => !keys.has(messageKey(m)));
+	if (ids.size) live.finals = live.finals.filter((m) => !m.id || !ids.has(m.id));
 	for (const id of results) delete live.tools[id];
 }

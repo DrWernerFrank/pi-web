@@ -3798,3 +3798,24 @@ select.field {
 		transition-duration: 0.01ms !important;
 	}
 }
+
+/* OpenCode group mark — same shape as the Antigravity "A", different hue. */
+.oc-mark {
+	display: inline-grid;
+	place-items: center;
+	width: 16px;
+	height: 16px;
+	border-radius: 5px;
+	background: linear-gradient(135deg, #f59e0b, #ef4444);
+	color: #fff;
+	font-size: 8.5px;
+	font-weight: 700;
+	letter-spacing: -0.02em;
+	flex: none;
+}
+.group-head .oc-mark {
+	margin-right: 2px;
+}
+.group-head.oc {
+	color: var(--text-dim, #986);
+}
